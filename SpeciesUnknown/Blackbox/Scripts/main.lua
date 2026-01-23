@@ -58,6 +58,7 @@ end
 local BRIDGE_DIR = _external_dir()
 local BRIDGE_CMD_PATH = BRIDGE_DIR .. "bridge_cmd.txt"
 local BRIDGE_ACK_PATH = BRIDGE_DIR .. "bridge_ack.txt"
+local BRIDGE_NOTICE_PATH = BRIDGE_DIR .. "bridge_notice.txt"
 
 local function _bridge_read_all(path)
     local f = io.open(path, "r")
@@ -85,6 +86,26 @@ local function _bridge_ack(id, ok, msg)
     local f = io.open(BRIDGE_ACK_PATH, "w")
     if f then
         f:write(line)
+        f:close()
+    end
+end
+
+local LAST_NOTICE_TEXT = ""
+local LAST_NOTICE_TIME = 0
+local NOTICE_COOLDOWN = 0.15
+
+local function _bridge_notice(text)
+    text = tostring(text or "")
+    local now = (Util and Util.now_time and Util.now_time()) or os.clock()
+    if text == "" then return end
+    if text == LAST_NOTICE_TEXT and (now - LAST_NOTICE_TIME) < NOTICE_COOLDOWN then
+        return
+    end
+    LAST_NOTICE_TEXT = text
+    LAST_NOTICE_TIME = now
+    local f = io.open(BRIDGE_NOTICE_PATH, "w")
+    if f then
+        f:write(text .. "\n")
         f:close()
     end
 end
@@ -142,6 +163,28 @@ local function _bridge_exec_cmd(line)
     end
     local ok, res = Commands.run(name, table.unpack(args))
     _bridge_ack(id, ok, res or "")
+end
+
+local function _emit_players_notice()
+    if not Commands or not Commands.run then return end
+    local ok, res = Commands.run("listplayers_gui")
+    if ok and type(res) == "string" and res:find("^PLAYERS=") then
+        _bridge_notice(res)
+    end
+end
+
+local function _emit_tp_notice()
+    if not Commands or not Commands.run then return end
+    local ok, res = Commands.run("tp_gui_state")
+    if ok and type(res) == "string" and res:find("^TPSTATE=") then
+        _bridge_notice(res)
+    end
+end
+
+local function _try_register_hook(fn_name, cb)
+    if not _G.RegisterHook then return false end
+    local ok, pre_id = pcall(RegisterHook, fn_name, cb)
+    return ok and pre_id
 end
 
 local BRIDGE_POLL_INTERVAL = 0.10
@@ -207,3 +250,21 @@ local function _start_bridge_loop()
 end
 
 _start_bridge_loop()
+
+-- ================== Event-based GUI updates ==================
+_G.BlackboxRecode.BridgeNotice = _bridge_notice
+
+local hooks = {
+    "/Script/Engine.PlayerController:ClientRestart",
+    "/Script/Engine.GameStateBase:OnRep_PlayerArray",
+    "/Script/Engine.PlayerState:OnRep_PlayerName",
+    "/Script/Engine.GameModeBase:PostLogin",
+    "/Script/Engine.GameModeBase:Logout",
+}
+
+for _, fn in ipairs(hooks) do
+    _try_register_hook(fn, function()
+        _emit_players_notice()
+        _emit_tp_notice()
+    end)
+end

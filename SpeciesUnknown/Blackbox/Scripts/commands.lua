@@ -143,20 +143,20 @@ end
 
 local function iter_children(children, fn)
     if not children or not fn then return end
-    if type(children) == "table" then
-        for _, entry in ipairs(children) do
-            fn(entry)
-        end
-        return
-    end
     if children.Num and children.Get then
         local ok, n = pcall(children.Num, children)
-        if not ok or not n then return end
+        if not ok or type(n) ~= "number" or n <= 0 then return end
         for i = 0, n - 1 do
             local ok2, entry = pcall(children.Get, children, i)
             if ok2 then
-                fn(entry)
+                pcall(fn, entry)
             end
+        end
+        return
+    end
+    if type(children) == "table" then
+        for _, entry in pairs(children) do
+            pcall(fn, entry)
         end
     end
 end
@@ -661,6 +661,13 @@ local function get_actor_location(obj)
     return nil
 end
 
+local function get_actor_rotation(obj)
+    if not is_valid(obj) or not obj.K2_GetActorRotation then return nil end
+    local ok, rot = pcall(obj.K2_GetActorRotation, obj)
+    if ok then return rot end
+    return nil
+end
+
 local function get_pawn_from_pc(pc)
     if not is_valid(pc) or not pc.K2_GetPawn then return nil end
     local ok, pawn = pcall(pc.K2_GetPawn, pc)
@@ -1027,6 +1034,14 @@ local function find_player_by_name(query)
         end
     end
     return partial
+end
+
+local function decode_arg(value)
+    value = tostring(value or "")
+    value = value:gsub("%%(%x%x)", function(hex)
+        return string.char(tonumber(hex, 16))
+    end)
+    return value
 end
 
 local function parse_target_args(args)
@@ -1502,6 +1517,73 @@ function Commands.init(Util, Pointers, Teleport)
         print(ok and ("[bringplayer] OK -> " .. tostring(entry.name)) or ("[bringplayer] FAIL -> " .. tostring(msg)))
         return true
     end, "bringplayer <name> -> teleports that player to you", "Players")
+
+    reg("tpplayerto", function(args)
+        if not TP or not TP.teleport or not TP.teleport_to_location then
+            print("[tpplayerto] Teleport module not loaded.")
+            return true
+        end
+        if not args or #args < 2 then
+            print("[tpplayerto] Usage: tpplayerto <player> <TP:key | P:name>")
+            return true
+        end
+        local target_query = decode_arg(args[1])
+        local dest_spec = decode_arg(table.concat(args, " ", 2))
+        local entry = find_player_by_name(target_query)
+        if not entry then
+            print("[tpplayerto] Player not found:", target_query)
+            return true
+        end
+        if not entry.pawn then
+            print("[tpplayerto] No pawn for player:", entry.name)
+            return true
+        end
+        local kind, value = dest_spec:match("^%s*(%a+)%s*:%s*(.+)$")
+        if not kind or not value then
+            print("[tpplayerto] Bad destination:", dest_spec)
+            return true
+        end
+        kind = tostring(kind):upper()
+        value = tostring(value)
+
+        if TP.save_local_return then
+            TP.save_local_return()
+        end
+
+        if kind == "TP" then
+            local ok, msg = TP.teleport(value, entry.pawn, false)
+            print(ok and ("[tpplayerto] OK -> " .. tostring(entry.name)) or ("[tpplayerto] FAIL -> " .. tostring(msg)))
+            return true
+        end
+
+        if kind == "P" or kind == "PLAYER" then
+            local dest_entry = find_player_by_name(value)
+            if not dest_entry then
+                print("[tpplayerto] Destination player not found:", value)
+                return true
+            end
+            if not dest_entry.pawn then
+                print("[tpplayerto] No pawn for destination:", dest_entry.name)
+                return true
+            end
+            local loc = get_actor_location(dest_entry.pawn)
+            if not loc then
+                print("[tpplayerto] No location for destination:", dest_entry.name)
+                return true
+            end
+            local rot = get_actor_rotation(dest_entry.pawn)
+            local pos = {
+                x = loc.X, y = loc.Y, z = loc.Z,
+                rot = rot and { pitch = rot.Pitch or 0, yaw = rot.Yaw or 0, roll = rot.Roll or 0 } or nil,
+            }
+            local ok, msg = TP.teleport_to_location(pos, entry.pawn, false)
+            print(ok and ("[tpplayerto] OK -> " .. tostring(entry.name)) or ("[tpplayerto] FAIL -> " .. tostring(msg)))
+            return true
+        end
+
+        print("[tpplayerto] Unsupported destination:", dest_spec)
+        return true
+    end, "tpplayerto <player> <TP:key | P:name> -> teleports player to destination", "Teleport")
 
     reg("returnself", function(args)
         if not TP or not TP.return_self then
@@ -2641,7 +2723,7 @@ function Commands.init(Util, Pointers, Teleport)
     Commands.actions.teleport_list = Commands.actions.tplist
 
     print("[BlackboxRecode] Commands loaded:",
-        "checkcommands, getmap, getpos, tp, tplist, returnself, returnall, listreturns, tpsetreturn, tpreturn, tpmap, tpallmap, bringallplayers, tpnearest, bringnearest, tp_gui_state, opencontracts, startcontract, listplayers, listplayers_gui, gotoplayer, bringplayer, heal, god, stamina, battery, walkspeed, sethp, setmaxhp, invisible, pipeall, pipeset, pipestatus, labairlockstatus, labairlockset, activateselfdestruct, gotoitem, bringitem, gotoweapon, bringweapon, gotomonster, bringmonster, listmonsters, removemonster, setweapondmg, unlimitedammo, maxammo, help")
+        "checkcommands, getmap, getpos, tp, tplist, returnself, returnall, listreturns, tpsetreturn, tpreturn, tpmap, tpallmap, bringallplayers, tpnearest, bringnearest, tp_gui_state, opencontracts, startcontract, listplayers, listplayers_gui, gotoplayer, bringplayer, tpplayerto, heal, god, stamina, battery, walkspeed, sethp, setmaxhp, invisible, pipeall, pipeset, pipestatus, labairlockstatus, labairlockset, activateselfdestruct, gotoitem, bringitem, gotoweapon, bringweapon, gotomonster, bringmonster, listmonsters, removemonster, setweapondmg, unlimitedammo, maxammo, help")
 end
 
 return Commands

@@ -2,10 +2,11 @@
 
 ## Overview
 Admin panel mod for the game Species: Unknown, eventually adding more features such as a radar
+This mod uses the lua API from UE4SS and an external python menu (Will be integrated into C++ mod eventually)
 
 ## Status
 🚧 **In Development** - This project is a work in progress, expect errors and broken features.
-Current Status: Working on GUI integration
+Current Status: Working on GUI integration and features
 
 ## Features
 

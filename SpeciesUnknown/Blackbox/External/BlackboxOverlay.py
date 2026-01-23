@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QPushButton, QCheckBox, QComboBox,
     QSlider, QMessageBox,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QFileSystemWatcher
 
 
 def _base_dir() -> Path:
@@ -54,6 +54,7 @@ def _base_dir() -> Path:
 BASE_DIR = _base_dir()
 CMD_PATH = str(BASE_DIR / "bridge_cmd.txt")
 ACK_PATH = str(BASE_DIR / "bridge_ack.txt")
+NOTICE_PATH = str(BASE_DIR / "bridge_notice.txt")
 
 
 class CommandBridge:
@@ -233,11 +234,15 @@ class ActionPanel(QWidget):
         self.tp_map_empty_lbl.setObjectName("panelHint")
         tp_map_l.addWidget(self.tp_map_empty_lbl)
 
-        self.tp_map_container = QWidget()
-        self.tp_map_layout = QVBoxLayout(self.tp_map_container)
-        self.tp_map_layout.setContentsMargins(0, 0, 0, 0)
-        self.tp_map_layout.setSpacing(6)
-        tp_map_l.addWidget(self.tp_map_container)
+        tp_map_row = QHBoxLayout()
+        self.tp_map_combo = QComboBox()
+        self.tp_map_combo.setObjectName("panelCombo")
+        tp_map_row.addWidget(self.tp_map_combo, 1)
+
+        self.tp_map_btn = QPushButton("Teleport")
+        self.tp_map_btn.setObjectName("panelButtonPrimary")
+        tp_map_row.addWidget(self.tp_map_btn)
+        tp_map_l.addLayout(tp_map_row)
 
         tp_layout.addWidget(tp_map_box)
 
@@ -287,6 +292,22 @@ class ActionPanel(QWidget):
         self.tp_bring_all_btn = QPushButton("Bring All Players")
         self.tp_bring_all_btn.setObjectName("panelButtonPrimary")
         tp_players_l.addWidget(self.tp_bring_all_btn)
+
+        tp_target_row = QHBoxLayout()
+        self.tp_target_combo = QComboBox()
+        self.tp_target_combo.setObjectName("panelCombo")
+        tp_target_row.addWidget(self.tp_target_combo, 1)
+
+        self.tp_player_btn = QPushButton("Teleport Player")
+        self.tp_player_btn.setObjectName("panelButton")
+        tp_target_row.addWidget(self.tp_player_btn)
+        tp_players_l.addLayout(tp_target_row)
+
+        tp_dest_row = QHBoxLayout()
+        self.tp_dest_combo = QComboBox()
+        self.tp_dest_combo.setObjectName("panelCombo")
+        tp_dest_row.addWidget(self.tp_dest_combo, 1)
+        tp_players_l.addLayout(tp_dest_row)
 
         tp_all_row = QHBoxLayout()
         self.tp_all_combo = QComboBox()
@@ -524,10 +545,16 @@ class ActionPanel(QWidget):
         self.tp_refresh_btn.clicked.connect(self._refresh_tp_state)
         self.tp_set_return_btn.clicked.connect(self._tp_set_return)
         self.tp_return_btn.clicked.connect(self._tp_return)
+        self.tp_map_btn.clicked.connect(self._tp_map_teleport)
+        self.tp_map_combo.currentIndexChanged.connect(self._update_tp_actions)
         self.tp_near_tp_btn.clicked.connect(self._tp_nearest)
         self.tp_near_bring_btn.clicked.connect(self._tp_bring_nearest)
         self.tp_near_combo.currentIndexChanged.connect(self._update_tp_actions)
         self.tp_bring_all_btn.clicked.connect(self._tp_bring_all)
+        self.tp_target_combo.currentIndexChanged.connect(self._on_tp_target_changed)
+        self.tp_dest_combo.currentIndexChanged.connect(self._update_tp_actions)
+        self.tp_player_btn.clicked.connect(self._tp_player_to)
+        self.tp_all_combo.currentIndexChanged.connect(self._update_tp_actions)
         self.tp_all_btn.clicked.connect(self._tp_all_players)
 
         # Ack polling (bridge responses)
@@ -546,10 +573,27 @@ class ActionPanel(QWidget):
             "near": {},
             "others": 0,
         }
+        self._player_names = []
+        self._self_name = None
 
         self._update_target_actions()
         self._update_tp_actions()
-        QTimer.singleShot(150, self._refresh_tp_state)
+
+        # Notice watcher (event-based updates from UE4SS)
+        self._notice_path = NOTICE_PATH
+        self._notice_watcher = QFileSystemWatcher(self)
+        try:
+            if self._notice_path:
+                if not Path(self._notice_path).exists():
+                    Path(self._notice_path).write_text("", encoding="utf-8")
+                self._notice_watcher.addPath(self._notice_path)
+        except Exception:
+            pass
+        self._notice_watcher.fileChanged.connect(self._on_notice_changed)
+
+        # Initial sync
+        QTimer.singleShot(150, self._refresh_players)
+        QTimer.singleShot(200, self._refresh_tp_state)
 
         self.setStyleSheet("""
             QWidget {
@@ -793,6 +837,8 @@ class ActionPanel(QWidget):
         return base.strip()
 
     def _refresh_players(self):
+        if self._ack_handlers:
+            return
         cmd_id = self._send("listplayers_gui", "")
         if not cmd_id:
             return
@@ -863,6 +909,8 @@ class ActionPanel(QWidget):
         self._set_walkspeed()
 
     def _refresh_tp_state(self):
+        if self._ack_handlers:
+            return
         cmd_id = self._send("tp_gui_state", "")
         if not cmd_id:
             return
@@ -923,9 +971,43 @@ class ActionPanel(QWidget):
         payload = msg[len("TPSTATE="):]
         self._apply_tp_state(payload)
 
+    def _on_notice_changed(self, _path: str):
+        try:
+            if not self._notice_path:
+                return
+            p = Path(self._notice_path)
+            if not p.exists():
+                p.write_text("", encoding="utf-8")
+                self._notice_watcher.addPath(self._notice_path)
+                return
+            data = p.read_text(encoding="utf-8") if p.stat().st_size > 0 else ""
+        except Exception:
+            return
+
+        line = ""
+        for raw in (data or "").splitlines():
+            if raw.strip():
+                line = raw.strip()
+        if not line:
+            return
+
+        if line.startswith("PLAYERS="):
+            payload = line[len("PLAYERS="):]
+            self._apply_player_list(payload)
+        elif line.startswith("TPSTATE="):
+            payload = line[len("TPSTATE="):]
+            self._apply_tp_state(payload)
+
+        try:
+            if self._notice_path not in self._notice_watcher.files():
+                self._notice_watcher.addPath(self._notice_path)
+        except Exception:
+            pass
+
     def _apply_player_list(self, payload: str):
         entries = [e for e in str(payload or "").split(";") if e]
         current = self.target_combo.currentData()
+        tp_current = self.tp_target_combo.currentData() if self.tp_target_combo else None
         self.target_combo.blockSignals(True)
         self.target_combo.clear()
 
@@ -940,6 +1022,12 @@ class ActionPanel(QWidget):
                 names.append(entry)
 
         names = [n for n in names if n]
+        all_names = set(names)
+        if self_name:
+            all_names.add(self_name)
+        player_names = sorted(all_names, key=lambda s: str(s).lower())
+        self._player_names = player_names
+        self._self_name = self_name
         if not names and not self_name:
             self.target_combo.addItem("No Players Found", "")
             self.target_combo.setEnabled(False)
@@ -960,18 +1048,92 @@ class ActionPanel(QWidget):
                 if idx >= 0:
                     self.target_combo.setCurrentIndex(idx)
         self.target_combo.blockSignals(False)
+        self._refresh_tp_targets(tp_current)
+        self._refresh_tp_destinations()
         self._update_target_actions()
+        self._update_tp_actions()
+
+    def _player_label(self, name: str) -> str:
+        name = str(name or "")
+        if not name:
+            return name
+        if self._self_name and name.strip().lower() == str(self._self_name).strip().lower():
+            return f"{name} (Self)"
+        return name
+
+    def _refresh_tp_targets(self, current=None):
+        if not self.tp_target_combo:
+            return
+        self.tp_target_combo.blockSignals(True)
+        self.tp_target_combo.clear()
+        if not self._player_names:
+            self.tp_target_combo.addItem("No Players Found", "")
+            self.tp_target_combo.setEnabled(False)
+        else:
+            self.tp_target_combo.setEnabled(True)
+            for name in self._player_names:
+                self.tp_target_combo.addItem(self._player_label(name), name)
+            if current:
+                idx = self.tp_target_combo.findData(current)
+                if idx >= 0:
+                    self.tp_target_combo.setCurrentIndex(idx)
+        self.tp_target_combo.blockSignals(False)
+
+    def _refresh_tp_map_combo(self):
+        tps = list(self._tp_state.get("teleports") or [])
+        current = self.tp_map_combo.currentData()
+        self.tp_map_combo.blockSignals(True)
+        self.tp_map_combo.clear()
+        for key, name in tps:
+            self.tp_map_combo.addItem(str(name), str(key))
+        self.tp_map_combo.blockSignals(False)
+        if current:
+            idx = self.tp_map_combo.findData(current)
+            if idx >= 0:
+                self.tp_map_combo.setCurrentIndex(idx)
+        self.tp_map_empty_lbl.setVisible(len(tps) == 0)
+
+        current_all = self.tp_all_combo.currentData()
+        self.tp_all_combo.blockSignals(True)
+        self.tp_all_combo.clear()
+        for key, name in tps:
+            self.tp_all_combo.addItem(str(name), str(key))
+        self.tp_all_combo.blockSignals(False)
+        if current_all:
+            idx = self.tp_all_combo.findData(current_all)
+            if idx >= 0:
+                self.tp_all_combo.setCurrentIndex(idx)
+
+    def _refresh_tp_destinations(self):
+        if not self.tp_dest_combo:
+            return
+        target = self._tp_target_name()
+        current = self.tp_dest_combo.currentData()
+        self.tp_dest_combo.blockSignals(True)
+        self.tp_dest_combo.clear()
+
+        tps = list(self._tp_state.get("teleports") or [])
+        for key, name in tps:
+            self.tp_dest_combo.addItem(f"TP: {name}", f"TP:{key}")
+
+        for name in self._player_names:
+            if target and str(name).strip().lower() == str(target).strip().lower():
+                continue
+            label = self._player_label(name)
+            self.tp_dest_combo.addItem(f"Player: {label}", f"P:{name}")
+
+        if self.tp_dest_combo.count() == 0:
+            self.tp_dest_combo.addItem("No Destinations", "")
+            self.tp_dest_combo.setEnabled(False)
+        else:
+            self.tp_dest_combo.setEnabled(True)
+            if current:
+                idx = self.tp_dest_combo.findData(current)
+                if idx >= 0:
+                    self.tp_dest_combo.setCurrentIndex(idx)
+        self.tp_dest_combo.blockSignals(False)
 
     # ----------------- Teleport UI -----------------
-    def _clear_layout(self, layout):
-        while layout.count():
-            item = layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-            elif item.layout() is not None:
-                self._clear_layout(item.layout())
-
     def _apply_tp_state(self, payload: str):
         state = {
             "map": "Unknown",
@@ -1020,29 +1182,9 @@ class ActionPanel(QWidget):
 
         self._tp_state = state
         self.tp_map_lbl.setText(f"Map: {state['map']}")
-        self._render_tp_map_buttons()
+        self._refresh_tp_map_combo()
+        self._refresh_tp_destinations()
         self._update_tp_actions()
-
-    def _render_tp_map_buttons(self):
-        self._clear_layout(self.tp_map_layout)
-        tps = list(self._tp_state.get("teleports") or [])
-        if not tps:
-            self.tp_map_empty_lbl.setVisible(True)
-            self.tp_map_container.setVisible(False)
-        else:
-            self.tp_map_empty_lbl.setVisible(False)
-            self.tp_map_container.setVisible(True)
-            for key, name in tps:
-                btn = QPushButton(str(name))
-                btn.setObjectName("panelButtonPrimary")
-                btn.clicked.connect(lambda _=False, k=key: self._tp_map_teleport(k))
-                self.tp_map_layout.addWidget(btn)
-        # Teleport-all combo
-        self.tp_all_combo.blockSignals(True)
-        self.tp_all_combo.clear()
-        for key, name in tps:
-            self.tp_all_combo.addItem(str(name), key)
-        self.tp_all_combo.blockSignals(False)
 
     def _update_tp_actions(self):
         pawn_ok = bool(self._tp_state.get("pawn"))
@@ -1053,10 +1195,9 @@ class ActionPanel(QWidget):
         self.tp_set_return_btn.setEnabled(pawn_ok)
         self.tp_return_btn.setEnabled(return_ok)
 
-        for i in range(self.tp_map_layout.count()):
-            w = self.tp_map_layout.itemAt(i).widget()
-            if w is not None:
-                w.setEnabled(map_ok)
+        has_tps = self.tp_map_combo.count() > 0
+        self.tp_map_combo.setEnabled(map_ok and has_tps)
+        self.tp_map_btn.setEnabled(map_ok and has_tps and bool(self.tp_map_combo.currentData()))
 
         near = self._tp_state.get("near") or {}
         current_type = str(self.tp_near_combo.currentData() or "").upper()
@@ -1065,9 +1206,14 @@ class ActionPanel(QWidget):
         self.tp_near_bring_btn.setEnabled(near_ok)
 
         self.tp_bring_all_btn.setEnabled(pawn_ok and others > 0)
-        has_tps = self.tp_all_combo.count() > 0
-        self.tp_all_combo.setEnabled(map_ok and has_tps)
-        self.tp_all_btn.setEnabled(map_ok and has_tps and others > 0)
+        has_all_tps = self.tp_all_combo.count() > 0
+        self.tp_all_combo.setEnabled(map_ok and has_all_tps)
+        self.tp_all_btn.setEnabled(map_ok and has_all_tps and others > 0)
+
+        target_ok = bool(self._tp_target_name())
+        dest_ok = bool(self._tp_dest_spec())
+        self.tp_target_combo.setEnabled(len(self._player_names) > 0)
+        self.tp_player_btn.setEnabled(pawn_ok and target_ok and dest_ok)
 
     def _tp_set_return(self):
         self._send("tpsetreturn", "")
@@ -1077,10 +1223,47 @@ class ActionPanel(QWidget):
         self._send("tpreturn", "")
         QTimer.singleShot(150, self._refresh_tp_state)
 
-    def _tp_map_teleport(self, key: str):
+    def _tp_map_teleport(self, key: str = ""):
+        if not key:
+            key = self.tp_map_combo.currentData()
         if not key:
             return
         self._send("tpmap", str(key))
+        QTimer.singleShot(150, self._refresh_tp_state)
+
+    def _on_tp_target_changed(self):
+        self._refresh_tp_destinations()
+        self._update_tp_actions()
+
+    def _tp_target_name(self) -> str:
+        if not self.tp_target_combo or not self.tp_target_combo.isEnabled():
+            return ""
+        data = self.tp_target_combo.currentData()
+        if data is None or str(data).strip() == "":
+            return ""
+        return str(data)
+
+    def _tp_dest_spec(self) -> str:
+        if not self.tp_dest_combo or not self.tp_dest_combo.isEnabled():
+            return ""
+        data = self.tp_dest_combo.currentData()
+        if data is None or str(data).strip() == "":
+            return ""
+        return str(data)
+
+    def _encode_arg(self, value: str) -> str:
+        s = str(value or "")
+        s = s.replace("%", "%25")
+        s = s.replace(" ", "%20")
+        return s
+
+    def _tp_player_to(self):
+        target = self._tp_target_name()
+        dest = self._tp_dest_spec()
+        if not target or not dest:
+            return
+        arg = f"{self._encode_arg(target)} {self._encode_arg(dest)}"
+        self._send("tpplayerto", arg)
         QTimer.singleShot(150, self._refresh_tp_state)
 
     def _tp_nearest(self):

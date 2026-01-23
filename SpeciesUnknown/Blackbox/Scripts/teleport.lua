@@ -5,6 +5,7 @@ local Teleport = {}
 
 local U = nil
 local P = nil
+local UEH = nil
 
 -- simple caches (keep tiny for now)
 local CACHED_MAP = "Unknown"
@@ -115,6 +116,41 @@ function Teleport.get_current_map()
                     end
                 end
                 if new_map ~= "Unknown" then break end
+            end
+        end
+    end
+
+    if new_map == "Unknown" and UEH and UEH.GetWorld then
+        local world = UEH.GetWorld()
+        if world and world.IsValid and world:IsValid() then
+            local name = nil
+            if world.GetMapName then
+                local ok, n = pcall(world.GetMapName, world)
+                if ok then name = n end
+            end
+            if (not name or name == "") and world.GetName then
+                local ok, n = pcall(world.GetName, world)
+                if ok then name = n end
+            end
+            if (not name or name == "") and world.GetFullName then
+                local ok, n = pcall(world.GetFullName, world)
+                if ok then name = n end
+            end
+            if name then
+                local low = tostring(name):lower()
+                local markers = (P and P.MAPS and P.MAPS.PackageMarkers) or {}
+                for map_name, list in pairs(markers) do
+                    if type(list) == "table" then
+                        for _, mk in ipairs(list) do
+                            mk = tostring(mk)
+                            if mk ~= "" and (tostring(name):find(mk, 1, true) or low:find(mk:lower(), 1, true)) then
+                                new_map = tostring(map_name)
+                                break
+                            end
+                        end
+                    end
+                    if new_map ~= "Unknown" then break end
+                end
             end
         end
     end
@@ -427,6 +463,10 @@ end
 function Teleport.init(Util, Pointers)
     U = Util
     P = Pointers
+    if UEH == nil then
+        local ok, mod = pcall(require, "UEHelpers")
+        if ok then UEH = mod else UEH = false end
+    end
     return true
 end
 
