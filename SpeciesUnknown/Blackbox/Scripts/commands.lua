@@ -83,6 +83,26 @@ local function split_ws(s)
     return out
 end
 
+local function set_hook_prints(enable)
+    _G.BlackboxRecode = _G.BlackboxRecode or {}
+    _G.BlackboxRecode.HookPrints = enable and true or false
+    return _G.BlackboxRecode.HookPrints
+end
+
+local function try_require_socket()
+    local candidates = { "socket", "socket.core", "luasocket" }
+    for _, name in ipairs(candidates) do
+        local ok, mod = pcall(require, name)
+        if ok and mod then
+            return mod, name
+        end
+    end
+    if type(_G.socket) == "table" then
+        return _G.socket, "_G.socket"
+    end
+    return nil, nil
+end
+
 local function is_valid(obj)
     if not obj then return false end
     if obj.IsValid then
@@ -143,11 +163,22 @@ end
 
 local function iter_children(children, fn)
     if not children or not fn then return end
-    if children.Num and children.Get then
-        local ok, n = pcall(children.Num, children)
-        if not ok or type(n) ~= "number" or n <= 0 then return end
+    local ok, n = safe_call(children, "Num")
+    if not ok or type(n) ~= "number" then
+        ok, n = safe_call(children, "GetArrayNum")
+    end
+    if not ok or type(n) ~= "number" then
+        ok, n = safe_call(children, "GetNum")
+    end
+    if ok and type(n) == "number" and n > 0 then
         for i = 0, n - 1 do
-            local ok2, entry = pcall(children.Get, children, i)
+            local ok2, entry = safe_call(children, "Get", i)
+            if not ok2 then
+                ok2, entry = safe_call(children, "GetValue", i)
+            end
+            if not ok2 then
+                ok2, entry = pcall(function() return children[i] end)
+            end
             if ok2 then
                 pcall(fn, entry)
             end
@@ -157,6 +188,16 @@ local function iter_children(children, fn)
     if type(children) == "table" then
         for _, entry in pairs(children) do
             pcall(fn, entry)
+        end
+        return
+    end
+    local ok_len, n2 = pcall(function() return #children end)
+    if ok_len and type(n2) == "number" and n2 > 0 then
+        for i = 0, n2 - 1 do
+            local ok2, entry = pcall(function() return children[i] end)
+            if ok2 then
+                pcall(fn, entry)
+            end
         end
     end
 end
@@ -622,36 +663,286 @@ local function write_pipe_array(term, prop, values, arr, base)
     return set_prop(term, prop, t)
 end
 
+local function resolve_pipe_indices(a, b)
+    local p = tonumber(a) or 0
+    local v = tonumber(b) or 0
+    if (p == 1 or p == 2) and v >= 1 and v <= 8 then
+        return p, v
+    end
+    if (v == 1 or v == 2) and p >= 1 and p <= 8 then
+        return v, p
+    end
+    return nil, nil
+end
+
+local function get_valve_indices(obj)
+    if not obj then return nil, nil end
+    local pidx = safe_get_field(obj, "PipeIndex")
+    if pidx == nil then
+        local ok, v = safe_call(obj, "GetPropertyValue", "PipeIndex")
+        if ok then pidx = v end
+    end
+    local vidx = safe_get_field(obj, "ValveIndex")
+    if vidx == nil then
+        local ok, v = safe_call(obj, "GetPropertyValue", "ValveIndex")
+        if ok then vidx = v end
+    end
+    return tonumber(pidx), tonumber(vidx)
+end
+
+local function get_valve_on(obj)
+    if not obj then return nil end
+    local function read_prop(name)
+        local v = safe_get_field(obj, name)
+        if v == nil then
+            local ok, pv = safe_call(obj, "GetPropertyValue", name)
+            if ok then v = pv end
+        end
+        return v
+    end
+    for _, name in ipairs({ "On", "bOn", "IsOn", "bIsOn", "Active", "bActive" }) do
+        local v = read_prop(name)
+        if v ~= nil then
+            if type(v) == "boolean" then return v end
+            if type(v) == "number" then return v ~= 0 end
+            if type(v) == "string" then
+                local b = parse_bool(v)
+                if b ~= nil then return b end
+            end
+        end
+    end
+    return nil
+end
+
+local function set_valve_on(obj, enable)
+    if not is_valid(obj) then return false end
+    local val = enable and true or false
+    local set_ok = false
+    pcall(function()
+        if obj.On ~= nil then
+            obj.On = val
+            set_ok = true
+            return
+        end
+        if obj.bOn ~= nil then
+            obj.bOn = val
+            set_ok = true
+            return
+        end
+        if obj.IsOn ~= nil then
+            obj.IsOn = val
+            set_ok = true
+            return
+        end
+        if obj.bIsOn ~= nil then
+            obj.bIsOn = val
+            set_ok = true
+        end
+    end)
+    if set_ok then
+        return true
+    end
+    if obj.SetPropertyValue then
+        local ok1 = pcall(obj.SetPropertyValue, obj, "On", val)
+        if ok1 then return true end
+        local ok2 = pcall(obj.SetPropertyValue, obj, "bOn", val)
+        if ok2 then return true end
+        local ok3 = pcall(obj.SetPropertyValue, obj, "IsOn", val)
+        if ok3 then return true end
+        local ok4 = pcall(obj.SetPropertyValue, obj, "bIsOn", val)
+        if ok4 then return true end
+    end
+    if set_prop(obj, "On", val) then return true end
+    if set_prop(obj, "bOn", val) then return true end
+    if set_prop(obj, "IsOn", val) then return true end
+    if set_prop(obj, "bIsOn", val) then return true end
+    return false
+end
+
+local function merge_valve_state(current, next)
+    if next == nil then return current end
+    if current == true then return true end
+    if current == false then
+        return (next == true) and true or false
+    end
+    return next
+end
+
+local function get_valve_states_by_set()
+    local cls = (P and P.PIPES and P.PIPES.ValvePipe) or "BP_ValvePipe_C"
+    local valves = find_all(cls) or {}
+    local out = { [1] = {}, [2] = {} }
+    local found = false
+    for _, obj in ipairs(valves) do
+        if is_valid(obj) then
+            local pidx, vidx = get_valve_indices(obj)
+            local set_idx, pipe_num = resolve_pipe_indices(pidx, vidx)
+            if set_idx and pipe_num then
+                local on_flag = get_valve_on(obj)
+                out[set_idx][pipe_num] = merge_valve_state(out[set_idx][pipe_num], on_flag)
+                found = true
+            end
+        end
+    end
+    return found, out
+end
+
+local function merge_pipe_values(base_values, fallback_values)
+    if not fallback_values then return base_values end
+    local out = base_values or {}
+    for i = 1, 8 do
+        if out[i] == nil and fallback_values[i] ~= nil then
+            out[i] = fallback_values[i]
+        end
+    end
+    return out
+end
+
+local function set_valves_for_pipe(pipe_set, pipe_idx, enable)
+    local cls = (P and P.PIPES and P.PIPES.ValvePipe) or "BP_ValvePipe_C"
+    local valves = find_all(cls) or {}
+    local count = 0
+    for _, obj in ipairs(valves) do
+        if is_valid(obj) then
+            local pidx, vidx = get_valve_indices(obj)
+            local set_idx, pipe_num = resolve_pipe_indices(pidx, vidx)
+            local match = false
+            if set_idx and pipe_num then
+                match = (set_idx == pipe_set and pipe_num == pipe_idx)
+            else
+                match = (pidx == pipe_set and vidx == pipe_idx)
+            end
+            if match then
+                if set_valve_on(obj, enable) then
+                    count = count + 1
+                end
+            end
+        end
+    end
+    return count > 0, count
+end
+
+local function set_all_valves(enable)
+    local cls = (P and P.PIPES and P.PIPES.ValvePipe) or "BP_ValvePipe_C"
+    local valves = find_all(cls) or {}
+    local count = 0
+    for _, obj in ipairs(valves) do
+        if is_valid(obj) then
+            if set_valve_on(obj, enable) then
+                count = count + 1
+            end
+        end
+    end
+    return count > 0, count
+end
+
 local function set_terminal_pipe_state(pipe_set, pipe_idx, enable)
     local term = get_pipe_terminal()
-    if not term then return false end
     if pipe_idx < 1 or pipe_idx > 8 then return false end
-    local prop = (pipe_set == 1) and "Pipe1" or "Pipe2"
-    local values, raw, base, hits = read_pipe_array(term, prop)
-    local desired = enable and true or false
-    if not values then
-        values = {}
-        for i = 1, 8 do values[i] = false end
+    local term_ok = false
+    if term then
+        local prop = (pipe_set == 1) and "Pipe1" or "Pipe2"
+        local values, raw, base, hits = read_pipe_array(term, prop)
+        local desired = enable and true or false
+        if not values then
+            values = {}
+            for i = 1, 8 do values[i] = false end
+        end
+        values[pipe_idx] = desired
+        term_ok = write_pipe_array(term, prop, values, raw, base)
     end
-    values[pipe_idx] = desired
-    return write_pipe_array(term, prop, values, raw, base)
+    local valve_ok = set_valves_for_pipe(pipe_set, pipe_idx, enable)
+    return term_ok or valve_ok
 end
 
 local function set_terminal_all_pipes(enable)
     local term = get_pipe_terminal()
-    if not term then return false end
-    local val = enable and true or false
-    local values = {}
-    for i = 1, 8 do values[i] = val end
+    local term_ok = false
+    if term then
+        local val = enable and true or false
+        local values = {}
+        for i = 1, 8 do values[i] = val end
 
-    local function apply_all(prop)
-        local _, raw, base = read_pipe_array(term, prop)
-        return write_pipe_array(term, prop, values, raw, base)
+        local function apply_all(prop)
+            local _, raw, base = read_pipe_array(term, prop)
+            return write_pipe_array(term, prop, values, raw, base)
+        end
+
+        local ok1 = apply_all("Pipe1")
+        local ok2 = apply_all("Pipe2")
+        term_ok = ok1 or ok2
     end
+    local valve_ok = set_all_valves(enable)
+    return term_ok or valve_ok
+end
 
-    local ok1 = apply_all("Pipe1")
-    local ok2 = apply_all("Pipe2")
-    return ok1 or ok2
+local function pack_pipe_values(values)
+    local out = {}
+    for i = 1, 8 do
+        local v = values and values[i]
+        if v == true then
+            out[#out + 1] = "1"
+        elseif v == false then
+            out[#out + 1] = "0"
+        else
+            out[#out + 1] = "?"
+        end
+    end
+    return table.concat(out)
+end
+
+local function pack_air_entries(entries)
+    if not entries or #entries == 0 then return "" end
+    local out = {}
+    for _, entry in ipairs(entries) do
+        local letter = entry.letter or "?"
+        local v = entry.valid
+        local val = (v == true and "1") or (v == false and "0") or "?"
+        out[#out + 1] = tostring(letter) .. "=" .. val
+    end
+    return table.concat(out, ",")
+end
+
+local function build_puzzles_payload()
+    local parts = {}
+
+    local pipe_term = get_pipe_terminal()
+    local valves_found, valve_states = get_valve_states_by_set()
+    local pipe_found = (pipe_term ~= nil) or valves_found
+    parts[#parts + 1] = "PIPEFOUND:" .. (pipe_found and "1" or "0")
+    local r_values = nil
+    local b_values = nil
+    if pipe_term then
+        r_values = read_pipe_array(pipe_term, "Pipe2")
+        b_values = read_pipe_array(pipe_term, "Pipe1")
+    end
+    if valves_found then
+        r_values = merge_pipe_values(r_values, valve_states[2])
+        b_values = merge_pipe_values(b_values, valve_states[1])
+    end
+    parts[#parts + 1] = "PIPER:" .. pack_pipe_values(r_values)
+    parts[#parts + 1] = "PIPEB:" .. pack_pipe_values(b_values)
+
+    local air_term = get_lab_terminal()
+    local air_found = air_term ~= nil
+    parts[#parts + 1] = "AIRFOUND:" .. (air_found and "1" or "0")
+    local air_entries = {}
+    if air_term then
+        local entries = get_array_property_structs(air_term, LAB_STATUT_PROP)
+        if entries and #entries > 0 then
+            for _, entry in ipairs(entries) do
+                local letter = coerce_string(get_struct_field(entry, LAB_LETTER_PROP))
+                if not letter or letter == "" then
+                    letter = "?"
+                end
+                local valid = get_struct_field(entry, LAB_VALID_PROP)
+                air_entries[#air_entries + 1] = { letter = letter, valid = valid }
+            end
+        end
+    end
+    parts[#parts + 1] = "AIR:" .. pack_air_entries(air_entries)
+
+    return "PUZZLES=" .. table.concat(parts, "#")
 end
 
 local function get_actor_location(obj)
@@ -1220,6 +1511,27 @@ function Commands.init(Util, Pointers, Teleport)
         print(string.format("[POS] X=%.2f Y=%.2f Z=%.2f", loc.X or 0, loc.Y or 0, loc.Z or 0))
         return true
     end, "prints your current location (X,Y,Z)", "Debug")
+
+    reg("hookprints", function(args)
+        local mode = args and args[1] and tostring(args[1]):lower() or ""
+        if mode == "" then
+            local cur = _G.BlackboxRecode and _G.BlackboxRecode.HookPrints or false
+            print("[hookprints] " .. (cur and "ON" or "OFF"))
+            return true
+        end
+        local enable = parse_bool(mode)
+        if enable == nil and mode == "toggle" then
+            local cur = _G.BlackboxRecode and _G.BlackboxRecode.HookPrints or false
+            enable = not cur
+        end
+        if enable == nil then
+            print("[hookprints] Usage: hookprints <on|off|toggle>")
+            return true
+        end
+        local state = set_hook_prints(enable)
+        print("[hookprints] " .. (state and "ON" or "OFF"))
+        return true
+    end, "hookprints <on|off|toggle> -> log when hooks fire", "Debug")
 
     -- 3) teleport core
     reg("tp", function(args)
@@ -2234,6 +2546,11 @@ function Commands.init(Util, Pointers, Teleport)
         return true
     end, "labairlockset <on|off> | <1-4|all> <on|off> -> set Valid flag(s)", "Lab")
 
+    reg("puzzlestate", function(args)
+        local payload = build_puzzles_payload()
+        return true, payload
+    end, "GUI: returns puzzles state string", "Puzzles")
+
     reg("activateselfdestruct", function(args)
         local engines = find_all("BP_Engine_C") or {}
         if #engines == 0 then
@@ -2723,7 +3040,7 @@ function Commands.init(Util, Pointers, Teleport)
     Commands.actions.teleport_list = Commands.actions.tplist
 
     print("[BlackboxRecode] Commands loaded:",
-        "checkcommands, getmap, getpos, tp, tplist, returnself, returnall, listreturns, tpsetreturn, tpreturn, tpmap, tpallmap, bringallplayers, tpnearest, bringnearest, tp_gui_state, opencontracts, startcontract, listplayers, listplayers_gui, gotoplayer, bringplayer, tpplayerto, heal, god, stamina, battery, walkspeed, sethp, setmaxhp, invisible, pipeall, pipeset, pipestatus, labairlockstatus, labairlockset, activateselfdestruct, gotoitem, bringitem, gotoweapon, bringweapon, gotomonster, bringmonster, listmonsters, removemonster, setweapondmg, unlimitedammo, maxammo, help")
+        "checkcommands, getmap, getpos, hookprints, testsocket, tp, tplist, returnself, returnall, listreturns, tpsetreturn, tpreturn, tpmap, tpallmap, bringallplayers, tpnearest, bringnearest, tp_gui_state, opencontracts, startcontract, listplayers, listplayers_gui, gotoplayer, bringplayer, tpplayerto, heal, god, stamina, battery, walkspeed, sethp, setmaxhp, invisible, pipeall, pipeset, pipestatus, labairlockstatus, labairlockset, puzzlestate, activateselfdestruct, gotoitem, bringitem, gotoweapon, bringweapon, gotomonster, bringmonster, listmonsters, removemonster, setweapondmg, unlimitedammo, maxammo, help")
 end
 
 return Commands

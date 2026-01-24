@@ -1,10 +1,8 @@
--- BlackboxRecode (Lua-only)
--- v0: command system test
--- v1: teleport commands + shared action functions for future GUI
-
 local function _script_dir()
     local src = debug.getinfo(1, "S").source or ""
-    if src:sub(1, 1) == "@" then src = src:sub(2) end
+    if src:sub(1, 1) == "@" then
+        src = src:sub(2)
+    end
     return (src:match("^(.*[\\/])") or "")
 end
 
@@ -24,7 +22,6 @@ local Pointers = load_local("pointers.lua") or {}
 local Teleport = load_local("teleport.lua") or {}
 local Commands = load_local("commands.lua") or {}
 
--- Expose a single global table so future GUI can call actions without console commands.
 _G.BlackboxRecode = _G.BlackboxRecode or {}
 _G.BlackboxRecode.Util     = Util
 _G.BlackboxRecode.Pointers = Pointers
@@ -47,7 +44,6 @@ else
     print("[BlackboxRecode] commands.lua missing Commands.init(Util, Pointers, Teleport)")
 end
 
--- ================== External Bridge (Optional GUI) ==================
 local function _external_dir()
     local dir = _script_dir()
     dir = dir:gsub("[\\/]+$", "")
@@ -70,7 +66,10 @@ end
 
 local function _bridge_clear(path)
     local f = io.open(path, "w")
-    if f then f:write("") f:close() end
+    if f then
+        f:write("")
+        f:close()
+    end
 end
 
 local function _sanitize_token(s)
@@ -111,10 +110,6 @@ local function _bridge_notice(text)
 end
 
 local function _bridge_parse_cmd(line)
-    -- Supports:
-    --  CMD|id|NAME|ARG
-    --  NAME|ARG|ID
-    --  NAME|ARG
     local id, name, arg = "", "", ""
 
     local p1, p2, p3, p4 = line:match("^(.-)%|(.-)%|(.-)%|(.*)$")
@@ -163,28 +158,82 @@ local function _bridge_exec_cmd(line)
     end
     local ok, res = Commands.run(name, table.unpack(args))
     _bridge_ack(id, ok, res or "")
-end
-
-local function _emit_players_notice()
-    if not Commands or not Commands.run then return end
-    local ok, res = Commands.run("listplayers_gui")
-    if ok and type(res) == "string" and res:find("^PLAYERS=") then
-        _bridge_notice(res)
+    if name == "listplayers_gui" and _emit_tp_notice then
+        _emit_tp_notice(true)
     end
 end
 
-local function _emit_tp_notice()
+local LAST_PLAYERS_TEXT = ""
+local LAST_TP_TEXT = ""
+
+local function _emit_tp_notice(force)
     if not Commands or not Commands.run then return end
     local ok, res = Commands.run("tp_gui_state")
     if ok and type(res) == "string" and res:find("^TPSTATE=") then
-        _bridge_notice(res)
+        if force or res ~= LAST_TP_TEXT then
+            LAST_TP_TEXT = res
+            _bridge_notice(res)
+            _bridge_ack("0", true, res)
+        end
+    end
+end
+
+local function _emit_players_notice(force)
+    if not Commands or not Commands.run then return end
+    local ok, res = Commands.run("listplayers_gui")
+    if ok and type(res) == "string" and res:find("^PLAYERS=") then
+        local changed = res ~= LAST_PLAYERS_TEXT
+        if force or changed then
+            LAST_PLAYERS_TEXT = res
+            _bridge_notice(res)
+        end
+        _emit_tp_notice(true)
+    end
+end
+
+local LAST_PUZZLES_TIME = 0
+local LAST_PUZZLES_TEXT = ""
+local PUZZLES_COOLDOWN = 0.25
+
+local function _emit_puzzles_notice()
+    if not Commands or not Commands.run then return end
+    local now = (Util and Util.now_time and Util.now_time()) or os.clock()
+    if (now - LAST_PUZZLES_TIME) < PUZZLES_COOLDOWN then
+        return
+    end
+    LAST_PUZZLES_TIME = now
+    local ok, res = Commands.run("puzzlestate")
+    if ok and type(res) == "string" and res:find("^PUZZLES=") then
+        if res ~= LAST_PUZZLES_TEXT then
+            LAST_PUZZLES_TEXT = res
+            _bridge_notice(res)
+            _bridge_ack("0", true, res)
+        end
+    end
+end
+
+local function _hook_print(cat, fn)
+    if not (_G.BlackboxRecode and _G.BlackboxRecode.HookPrints) then
+        return
+    end
+    cat = tostring(cat or "Hook")
+    fn = tostring(fn or "")
+    if fn ~= "" then
+        print(string.format("[Hook] %s -> %s", cat, fn))
+    else
+        print(string.format("[Hook] %s", cat))
     end
 end
 
 local function _try_register_hook(fn_name, cb)
     if not _G.RegisterHook then return false end
-    local ok, pre_id = pcall(RegisterHook, fn_name, cb)
-    return ok and pre_id
+    local name = tostring(fn_name or "")
+    if name:sub(1, 9) == "Function " then
+        name = name:sub(10)
+    end
+    if name == "" then return false end
+    local ok, hook_id = pcall(RegisterHook, name, cb)
+    return ok and hook_id ~= nil
 end
 
 local BRIDGE_POLL_INTERVAL = 0.10
@@ -223,13 +272,13 @@ local function _start_bridge_loop()
             "/Script/Engine.PlayerController:Tick",
             "/Script/Engine.Actor:Tick",
         }
-        for _, fn_name in ipairs(candidates) do
-            local ok, pre_id, post_id = pcall(RegisterHook, fn_name, function()
+        for _, fn in ipairs(candidates) do
+            local ok, hook_id = pcall(RegisterHook, fn, function()
                 _bridge_poll()
             end)
-            if ok and pre_id then
+            if ok and hook_id then
                 if Util and Util.log then
-                    Util.log("[BlackboxRecode] GUI bridge active (RegisterHook):", fn_name)
+                    Util.log("[BlackboxRecode] GUI bridge active (RegisterHook):", fn)
                 end
                 return
             end
@@ -251,10 +300,9 @@ end
 
 _start_bridge_loop()
 
--- ================== Event-based GUI updates ==================
 _G.BlackboxRecode.BridgeNotice = _bridge_notice
 
-local hooks = {
+local player_hooks = {
     "/Script/Engine.PlayerController:ClientRestart",
     "/Script/Engine.GameStateBase:OnRep_PlayerArray",
     "/Script/Engine.PlayerState:OnRep_PlayerName",
@@ -262,9 +310,67 @@ local hooks = {
     "/Script/Engine.GameModeBase:Logout",
 }
 
-for _, fn in ipairs(hooks) do
+for _, fn in ipairs(player_hooks) do
     _try_register_hook(fn, function()
-        _emit_players_notice()
-        _emit_tp_notice()
+        _hook_print("Players", fn)
+        _emit_players_notice(false)
+        _emit_tp_notice(true)
+    end)
+end
+
+local PUZZLE_MATCH = {
+    "BP_ReactorControl_Terminal_REFACT_C",
+    "BP_GAZ_Control_Terminal_REFACT_C",
+    "BP_ValvePipe_C",
+}
+
+local function _is_puzzle_actor(o)
+    if not o then return false end
+    local full = ""
+    if type(o) == "userdata" or type(o) == "table" then
+        if o.GetFullName then
+            local ok, res = pcall(o.GetFullName, o)
+            if ok then
+                full = tostring(res or "")
+            end
+        end
+    end
+    if full == "" then
+        full = tostring(o)
+    end
+    for _, s in ipairs(PUZZLE_MATCH) do
+        if full:find(s, 1, true) then
+            return true, s, full
+        end
+    end
+    return false, nil, full
+end
+
+local function _puzzle_bump(tag)
+    _hook_print("Puzzles", tag)
+    _emit_puzzles_notice()
+end
+
+local puzzle_generic_hooks = {
+    "/Script/Engine.Actor:ReceiveBeginPlay",
+    "/Script/Engine.Actor:EndPlay",
+    "/Script/Engine.Actor:ReceiveDestroyed",
+}
+
+for _, fn in ipairs(puzzle_generic_hooks) do
+    _try_register_hook(fn, function(self)
+        local ok, short = _is_puzzle_actor(self)
+        if ok then
+            _puzzle_bump(fn .. ":" .. tostring(short))
+        end
+    end)
+end
+
+if _G.NotifyOnNewObject then
+    pcall(NotifyOnNewObject, "/Script/Engine.Actor", function(obj)
+        local ok, short = _is_puzzle_actor(obj)
+        if ok then
+            _puzzle_bump("NewObject:" .. tostring(short))
+        end
     end)
 end

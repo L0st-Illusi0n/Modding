@@ -5,6 +5,7 @@ except Exception:
 from pathlib import Path
 
 import time
+import threading
 
 from PySide6.QtWidgets import (
     QApplication, QWidget,
@@ -14,7 +15,7 @@ from PySide6.QtWidgets import (
     QPushButton, QCheckBox, QComboBox,
     QSlider, QMessageBox,
 )
-from PySide6.QtCore import Qt, QTimer, QFileSystemWatcher
+from PySide6.QtCore import Qt, QFileSystemWatcher, Signal
 
 
 def _base_dir() -> Path:
@@ -79,6 +80,8 @@ class CommandBridge:
             return None
 
 class ActionPanel(QWidget):
+    _invoke = Signal(object)
+
     def __init__(self, send_cmd_cb):
         super().__init__()
         self._send_cmd = send_cmd_cb
@@ -168,6 +171,8 @@ class ActionPanel(QWidget):
 
         tp_layout = _make_tab("Teleport")
         player_layout = _make_tab("Player")
+        puzzles_layout = _make_tab("Puzzles")
+        debug_layout = _make_tab("Debug")
 
         # ================== TELEPORT ==================
         tp_top = QFrame()
@@ -348,6 +353,180 @@ class ActionPanel(QWidget):
 
         tp_layout.addWidget(tp_unfinished)
         tp_layout.addStretch(1)
+
+        # ================== PUZZLES ==================
+        puzzles_top = QFrame()
+        puzzles_top.setObjectName("groupBox")
+        puzzles_top_l = QVBoxLayout(puzzles_top)
+        puzzles_top_l.setContentsMargins(12, 10, 12, 10)
+        puzzles_top_l.setSpacing(8)
+
+        puzzles_hdr = QLabel("PUZZLES")
+        puzzles_hdr.setObjectName("groupHeader")
+        puzzles_top_l.addWidget(puzzles_hdr)
+
+        puzzles_row = QHBoxLayout()
+        self.puzzle_refresh_btn = QPushButton("Refresh Terminals")
+        self.puzzle_refresh_btn.setObjectName("panelButton")
+        puzzles_row.addWidget(self.puzzle_refresh_btn)
+
+        self.puzzle_status_lbl = QLabel("Status: Unknown")
+        self.puzzle_status_lbl.setObjectName("panelChip")
+        puzzles_row.addWidget(self.puzzle_status_lbl)
+        puzzles_row.addStretch(1)
+        puzzles_top_l.addLayout(puzzles_row)
+
+        puzzles_layout.addWidget(puzzles_top)
+
+        # Pipes
+        pipes_box = QFrame()
+        pipes_box.setObjectName("groupBox")
+        pipes_l = QVBoxLayout(pipes_box)
+        pipes_l.setContentsMargins(12, 10, 12, 10)
+        pipes_l.setSpacing(8)
+
+        pipes_hdr = QLabel("PIPES")
+        pipes_hdr.setObjectName("groupHeader")
+        pipes_l.addWidget(pipes_hdr)
+
+        self.pipes_term_lbl = QLabel("Terminal: Unknown")
+        self.pipes_term_lbl.setObjectName("panelChip")
+        pipes_l.addWidget(self.pipes_term_lbl)
+
+        pipes_btn_row = QHBoxLayout()
+        self.pipes_enable_all_btn = QPushButton("Enable All")
+        self.pipes_enable_all_btn.setObjectName("panelButtonPrimary")
+        pipes_btn_row.addWidget(self.pipes_enable_all_btn)
+        self.pipes_disable_all_btn = QPushButton("Disable All")
+        self.pipes_disable_all_btn.setObjectName("panelButton")
+        pipes_btn_row.addWidget(self.pipes_disable_all_btn)
+        pipes_btn_row.addStretch(1)
+        pipes_l.addLayout(pipes_btn_row)
+
+        pipes_cols = QHBoxLayout()
+        self.pipe_rows = []
+        for color_name, color_key in (("Red", "red"), ("Blue", "blue")):
+            col_box = QFrame()
+            col_box.setObjectName("panelInset")
+            col_l = QVBoxLayout(col_box)
+            col_l.setContentsMargins(8, 8, 8, 8)
+            col_l.setSpacing(6)
+
+            col_hdr = QLabel(f"{color_name} Pipes")
+            col_hdr.setObjectName("panelSubTitle")
+            col_l.addWidget(col_hdr)
+
+            for idx in range(1, 9):
+                row = QHBoxLayout()
+                lbl = QLabel(f"{color_name} {idx}")
+                lbl.setObjectName("panelSubTitle")
+                row.addWidget(lbl, 1)
+
+                status = QLabel("?")
+                status.setObjectName("panelChip")
+                row.addWidget(status, 0)
+
+                on_btn = QPushButton("Enable")
+                on_btn.setObjectName("panelButtonPrimary")
+                row.addWidget(on_btn, 0)
+
+                off_btn = QPushButton("Disable")
+                off_btn.setObjectName("panelButton")
+                row.addWidget(off_btn, 0)
+
+                col_l.addLayout(row)
+                self.pipe_rows.append({
+                    "color": color_key,
+                    "idx": idx,
+                    "label": lbl,
+                    "status": status,
+                    "on": on_btn,
+                    "off": off_btn,
+                })
+
+            pipes_cols.addWidget(col_box, 1)
+
+        pipes_l.addLayout(pipes_cols)
+        puzzles_layout.addWidget(pipes_box)
+
+        # Airlock
+        air_box = QFrame()
+        air_box.setObjectName("groupBox")
+        air_l = QVBoxLayout(air_box)
+        air_l.setContentsMargins(12, 10, 12, 10)
+        air_l.setSpacing(8)
+
+        air_hdr = QLabel("LAB AIRLOCK")
+        air_hdr.setObjectName("groupHeader")
+        air_l.addWidget(air_hdr)
+
+        self.air_term_lbl = QLabel("Terminal: Unknown")
+        self.air_term_lbl.setObjectName("panelChip")
+        air_l.addWidget(self.air_term_lbl)
+
+        air_btn_row = QHBoxLayout()
+        self.air_enable_all_btn = QPushButton("Enable All")
+        self.air_enable_all_btn.setObjectName("panelButtonPrimary")
+        air_btn_row.addWidget(self.air_enable_all_btn)
+        self.air_disable_all_btn = QPushButton("Disable All")
+        self.air_disable_all_btn.setObjectName("panelButton")
+        air_btn_row.addWidget(self.air_disable_all_btn)
+        air_btn_row.addStretch(1)
+        air_l.addLayout(air_btn_row)
+
+        self.air_rows = []
+        for idx in range(1, 5):
+            row = QHBoxLayout()
+            lbl = QLabel(f"Container {idx}")
+            lbl.setObjectName("panelSubTitle")
+            row.addWidget(lbl, 1)
+
+            status = QLabel("?")
+            status.setObjectName("panelChip")
+            row.addWidget(status, 0)
+
+            on_btn = QPushButton("Enable")
+            on_btn.setObjectName("panelButtonPrimary")
+            row.addWidget(on_btn, 0)
+
+            off_btn = QPushButton("Disable")
+            off_btn.setObjectName("panelButton")
+            row.addWidget(off_btn, 0)
+
+            air_l.addLayout(row)
+            self.air_rows.append({
+                "idx": idx,
+                "label": lbl,
+                "status": status,
+                "on": on_btn,
+                "off": off_btn,
+            })
+
+        puzzles_layout.addWidget(air_box)
+        puzzles_layout.addStretch(1)
+
+        # ================== DEBUG ==================
+        debug_box = QFrame()
+        debug_box.setObjectName("groupBox")
+        debug_l = QVBoxLayout(debug_box)
+        debug_l.setContentsMargins(12, 10, 12, 10)
+        debug_l.setSpacing(8)
+
+        debug_hdr = QLabel("DEBUG")
+        debug_hdr.setObjectName("groupHeader")
+        debug_l.addWidget(debug_hdr)
+
+        self.hook_prints_cb = QCheckBox("Hook Prints")
+        self.hook_prints_cb.setObjectName("panelCheck")
+        debug_l.addWidget(self.hook_prints_cb)
+
+        debug_hint = QLabel("Prints a log line when any hook fires.")
+        debug_hint.setObjectName("panelHint")
+        debug_hint.setWordWrap(True)
+        debug_l.addWidget(debug_hint)
+
+        debug_layout.addWidget(debug_box)
+        debug_layout.addStretch(1)
 
         # ================== PLAYER TARGET ==================
         target_box = QFrame()
@@ -557,12 +736,42 @@ class ActionPanel(QWidget):
         self.tp_all_combo.currentIndexChanged.connect(self._update_tp_actions)
         self.tp_all_btn.clicked.connect(self._tp_all_players)
 
+        self.puzzle_refresh_btn.clicked.connect(self._refresh_puzzles)
+        self.pipes_enable_all_btn.clicked.connect(lambda: self._pipe_all(True))
+        self.pipes_disable_all_btn.clicked.connect(lambda: self._pipe_all(False))
+        for row in self.pipe_rows:
+            row["on"].clicked.connect(
+                lambda _=False, c=row["color"], i=row["idx"]: self._pipe_set(c, i, True)
+            )
+            row["off"].clicked.connect(
+                lambda _=False, c=row["color"], i=row["idx"]: self._pipe_set(c, i, False)
+            )
+        self.air_enable_all_btn.clicked.connect(lambda: self._airlock_all(True))
+        self.air_disable_all_btn.clicked.connect(lambda: self._airlock_all(False))
+        for row in self.air_rows:
+            row["on"].clicked.connect(
+                lambda _=False, i=row["idx"]: self._airlock_set(i, True)
+            )
+            row["off"].clicked.connect(
+                lambda _=False, i=row["idx"]: self._airlock_set(i, False)
+            )
+
+        self.hook_prints_cb.stateChanged.connect(self._toggle_hook_prints)
+
+        self._invoke.connect(self._run_invoked)
+
         # Ack polling (bridge responses)
         self._ack_path = ACK_PATH
         self._ack_handlers = {}
-        self._ack_timer = QTimer(self)
-        self._ack_timer.setInterval(150)
-        self._ack_timer.timeout.connect(self._poll_ack)
+        self._ack_watcher = QFileSystemWatcher(self)
+        try:
+            if self._ack_path:
+                if not Path(self._ack_path).exists():
+                    Path(self._ack_path).write_text("", encoding="utf-8")
+                self._ack_watcher.addPath(self._ack_path)
+        except Exception:
+            pass
+        self._ack_watcher.fileChanged.connect(self._on_ack_changed)
 
         # Teleport state cache
         self._tp_state = {
@@ -573,15 +782,25 @@ class ActionPanel(QWidget):
             "near": {},
             "others": 0,
         }
+        self._puzzle_state = {
+            "pipe_found": False,
+            "pipe_red": [None] * 8,
+            "pipe_blue": [None] * 8,
+            "air_found": False,
+            "air_entries": [],
+        }
         self._player_names = []
         self._self_name = None
+        self._refresh_queue = []
 
         self._update_target_actions()
         self._update_tp_actions()
+        self._update_puzzle_actions()
 
         # Notice watcher (event-based updates from UE4SS)
         self._notice_path = NOTICE_PATH
         self._notice_watcher = QFileSystemWatcher(self)
+        self._last_notice_line = ""
         try:
             if self._notice_path:
                 if not Path(self._notice_path).exists():
@@ -592,8 +811,9 @@ class ActionPanel(QWidget):
         self._notice_watcher.fileChanged.connect(self._on_notice_changed)
 
         # Initial sync
-        QTimer.singleShot(150, self._refresh_players)
-        QTimer.singleShot(200, self._refresh_tp_state)
+        self._schedule(0.15, self._refresh_players)
+        self._schedule(0.20, self._refresh_tp_state)
+        self._schedule(0.25, self._refresh_puzzles)
 
         self.setStyleSheet("""
             QWidget {
@@ -802,6 +1022,12 @@ class ActionPanel(QWidget):
         except Exception:
             return None
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._schedule(0.05, self._refresh_players)
+        self._schedule(0.08, self._refresh_tp_state)
+        self._schedule(0.11, self._refresh_puzzles)
+
     def _target_text(self) -> str:
         if self.target_combo is None:
             return ""
@@ -897,6 +1123,10 @@ class ActionPanel(QWidget):
         state = "on" if self.invisible_cb.isChecked() else "off"
         self._send("invisible", self._with_target(state))
 
+    def _toggle_hook_prints(self):
+        state = "on" if self.hook_prints_cb.isChecked() else "off"
+        self._send("hookprints", state)
+
     def _on_walkspeed_slider(self, v: int):
         self.walkspeed_value_lbl.setText(str(int(v)))
 
@@ -910,30 +1140,59 @@ class ActionPanel(QWidget):
 
     def _refresh_tp_state(self):
         if self._ack_handlers:
-            return
+            return False
         cmd_id = self._send("tp_gui_state", "")
         if not cmd_id:
-            return
+            return False
         self._queue_ack(cmd_id, self._handle_tp_state_ack, 2.5)
+        return True
+
+    def _refresh_puzzles(self):
+        if self._ack_handlers:
+            return False
+        cmd_id = self._send("puzzlestate", "")
+        if not cmd_id:
+            return False
+        self._queue_ack(cmd_id, self._handle_puzzles_ack, 2.5)
+        return True
+
+    def _queue_followup_refreshes(self):
+        self._enqueue_refresh("tp")
+        self._enqueue_refresh("puzzles")
+        self._run_refresh_queue()
+
+    def _enqueue_refresh(self, key: str):
+        if key not in self._refresh_queue:
+            self._refresh_queue.append(key)
+
+    def _run_refresh_queue(self):
+        if self._ack_handlers or not self._refresh_queue:
+            return
+        next_key = self._refresh_queue[0]
+        started = False
+        if next_key == "tp":
+            started = self._refresh_tp_state()
+        elif next_key == "puzzles":
+            started = self._refresh_puzzles()
+        if started:
+            self._refresh_queue.pop(0)
 
     def _queue_ack(self, cmd_id, handler, timeout_s: float):
         try:
             ack_id = str(cmd_id)
             deadline = time.time() + float(timeout_s)
             self._ack_handlers[ack_id] = (deadline, handler)
-            if not self._ack_timer.isActive():
-                self._ack_timer.start()
         except Exception:
             pass
 
-    def _poll_ack(self):
+    def _cleanup_acks(self):
         now = time.time()
         expired = [k for k, v in self._ack_handlers.items() if v[0] < now]
         for k in expired:
             del self._ack_handlers[k]
-        if not self._ack_handlers:
-            self._ack_timer.stop()
-            return
+
+    def _on_ack_changed(self, _path: str):
+        self._cleanup_acks()
         try:
             if not self._ack_path:
                 return
@@ -947,15 +1206,28 @@ class ActionPanel(QWidget):
         if len(parts) < 4 or parts[0] != "ACK":
             return
         ack_id = parts[1]
+        ok = parts[2] == "1"
+        msg = parts[3] or ""
         handler_entry = self._ack_handlers.get(ack_id)
         if not handler_entry:
+            if ack_id == "0":
+                if msg.startswith("PUZZLES="):
+                    payload = msg[len("PUZZLES="):]
+                    self._apply_puzzles_state(payload)
+                elif msg.startswith("TPSTATE="):
+                    payload = msg[len("TPSTATE="):]
+                    self._apply_tp_state(payload)
             return
         _, handler = handler_entry
         del self._ack_handlers[ack_id]
-        ok = parts[2] == "1"
-        msg = parts[3] or ""
         try:
             handler(ok, msg)
+        except Exception:
+            pass
+
+        try:
+            if self._ack_path and self._ack_path not in self._ack_watcher.files():
+                self._ack_watcher.addPath(self._ack_path)
         except Exception:
             pass
 
@@ -964,12 +1236,21 @@ class ActionPanel(QWidget):
             return
         payload = msg[len("PLAYERS="):]
         self._apply_player_list(payload)
+        self._run_refresh_queue()
 
     def _handle_tp_state_ack(self, ok: bool, msg: str):
         if not ok or not msg.startswith("TPSTATE="):
             return
         payload = msg[len("TPSTATE="):]
         self._apply_tp_state(payload)
+        self._run_refresh_queue()
+
+    def _handle_puzzles_ack(self, ok: bool, msg: str):
+        if not ok or not msg.startswith("PUZZLES="):
+            return
+        payload = msg[len("PUZZLES="):]
+        self._apply_puzzles_state(payload)
+        self._run_refresh_queue()
 
     def _on_notice_changed(self, _path: str):
         try:
@@ -990,6 +1271,20 @@ class ActionPanel(QWidget):
                 line = raw.strip()
         if not line:
             return
+        self._process_notice_line(line)
+
+        try:
+            if self._notice_path not in self._notice_watcher.files():
+                self._notice_watcher.addPath(self._notice_path)
+        except Exception:
+            pass
+
+    def _process_notice_line(self, line: str):
+        if not line:
+            return
+        if line == self._last_notice_line:
+            return
+        self._last_notice_line = line
 
         if line.startswith("PLAYERS="):
             payload = line[len("PLAYERS="):]
@@ -997,12 +1292,9 @@ class ActionPanel(QWidget):
         elif line.startswith("TPSTATE="):
             payload = line[len("TPSTATE="):]
             self._apply_tp_state(payload)
-
-        try:
-            if self._notice_path not in self._notice_watcher.files():
-                self._notice_watcher.addPath(self._notice_path)
-        except Exception:
-            pass
+        elif line.startswith("PUZZLES="):
+            payload = line[len("PUZZLES="):]
+            self._apply_puzzles_state(payload)
 
     def _apply_player_list(self, payload: str):
         entries = [e for e in str(payload or "").split(";") if e]
@@ -1052,6 +1344,7 @@ class ActionPanel(QWidget):
         self._refresh_tp_destinations()
         self._update_target_actions()
         self._update_tp_actions()
+        self._queue_followup_refreshes()
 
     def _player_label(self, name: str) -> str:
         name = str(name or "")
@@ -1186,6 +1479,102 @@ class ActionPanel(QWidget):
         self._refresh_tp_destinations()
         self._update_tp_actions()
 
+    # ----------------- Puzzles UI -----------------
+    def _parse_pipe_string(self, value: str):
+        out = []
+        for ch in list(str(value or ""))[:8]:
+            if ch == "1":
+                out.append(True)
+            elif ch == "0":
+                out.append(False)
+            else:
+                out.append(None)
+        while len(out) < 8:
+            out.append(None)
+        return out
+
+    def _parse_air_entries(self, value: str):
+        entries = []
+        for part in str(value or "").split(","):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            letter, val = part.split("=", 1)
+            letter = letter.strip() or "?"
+            val = val.strip()
+            if val == "1":
+                v = True
+            elif val == "0":
+                v = False
+            else:
+                v = None
+            entries.append({"letter": letter, "valid": v})
+        return entries
+
+    def _apply_puzzles_state(self, payload: str):
+        state = {
+            "pipe_found": False,
+            "pipe_red": [None] * 8,
+            "pipe_blue": [None] * 8,
+            "air_found": False,
+            "air_entries": [],
+        }
+        for part in str(payload or "").split("#"):
+            if ":" not in part:
+                continue
+            key, val = part.split(":", 1)
+            key = key.strip().upper()
+            val = val.strip()
+            if key == "PIPEFOUND":
+                state["pipe_found"] = val == "1"
+            elif key == "PIPER":
+                state["pipe_red"] = self._parse_pipe_string(val)
+            elif key == "PIPEB":
+                state["pipe_blue"] = self._parse_pipe_string(val)
+            elif key == "AIRFOUND":
+                state["air_found"] = val == "1"
+            elif key == "AIR":
+                state["air_entries"] = self._parse_air_entries(val)
+
+        self._puzzle_state = state
+
+        pipe_status = "Found" if state["pipe_found"] else "Not Found"
+        air_status = "Found" if state["air_found"] else "Not Found"
+        self.puzzle_status_lbl.setText(f"Status: Pipes={pipe_status} | Airlock={air_status}")
+        self.pipes_term_lbl.setText(f"Terminal: {pipe_status}")
+        self.air_term_lbl.setText(f"Terminal: {air_status}")
+
+        for row in self.pipe_rows:
+            values = state["pipe_red"] if row["color"] == "red" else state["pipe_blue"]
+            idx = row["idx"] - 1
+            v = values[idx] if idx < len(values) else None
+            if v is True:
+                row["status"].setText("ON")
+            elif v is False:
+                row["status"].setText("OFF")
+            else:
+                row["status"].setText("?")
+
+        entries = state.get("air_entries") or []
+        for row in self.air_rows:
+            idx = row["idx"] - 1
+            if idx < len(entries):
+                entry = entries[idx]
+                letter = entry.get("letter") or "?"
+                row["label"].setText(f"Container {letter}")
+                valid = entry.get("valid")
+                if valid is True:
+                    row["status"].setText("VALID")
+                elif valid is False:
+                    row["status"].setText("INVALID")
+                else:
+                    row["status"].setText("?")
+            else:
+                row["label"].setText(f"Container {row['idx']}")
+                row["status"].setText("?")
+
+        self._update_puzzle_actions()
+
     def _update_tp_actions(self):
         pawn_ok = bool(self._tp_state.get("pawn"))
         map_ok = pawn_ok and (self._tp_state.get("map") or "Unknown") != "Unknown"
@@ -1215,13 +1604,31 @@ class ActionPanel(QWidget):
         self.tp_target_combo.setEnabled(len(self._player_names) > 0)
         self.tp_player_btn.setEnabled(pawn_ok and target_ok and dest_ok)
 
+    def _update_puzzle_actions(self):
+        pipe_found = bool(self._puzzle_state.get("pipe_found"))
+        for row in self.pipe_rows:
+            row["on"].setEnabled(pipe_found)
+            row["off"].setEnabled(pipe_found)
+        self.pipes_enable_all_btn.setEnabled(pipe_found)
+        self.pipes_disable_all_btn.setEnabled(pipe_found)
+
+        air_found = bool(self._puzzle_state.get("air_found"))
+        entries = self._puzzle_state.get("air_entries") or []
+        for row in self.air_rows:
+            idx = row["idx"] - 1
+            enabled = air_found and idx < len(entries)
+            row["on"].setEnabled(enabled)
+            row["off"].setEnabled(enabled)
+        self.air_enable_all_btn.setEnabled(air_found)
+        self.air_disable_all_btn.setEnabled(air_found)
+
     def _tp_set_return(self):
         self._send("tpsetreturn", "")
-        QTimer.singleShot(150, self._refresh_tp_state)
+        self._schedule(0.15, self._refresh_tp_state)
 
     def _tp_return(self):
         self._send("tpreturn", "")
-        QTimer.singleShot(150, self._refresh_tp_state)
+        self._schedule(0.15, self._refresh_tp_state)
 
     def _tp_map_teleport(self, key: str = ""):
         if not key:
@@ -1229,7 +1636,7 @@ class ActionPanel(QWidget):
         if not key:
             return
         self._send("tpmap", str(key))
-        QTimer.singleShot(150, self._refresh_tp_state)
+        self._schedule(0.15, self._refresh_tp_state)
 
     def _on_tp_target_changed(self):
         self._refresh_tp_destinations()
@@ -1264,7 +1671,30 @@ class ActionPanel(QWidget):
             return
         arg = f"{self._encode_arg(target)} {self._encode_arg(dest)}"
         self._send("tpplayerto", arg)
-        QTimer.singleShot(150, self._refresh_tp_state)
+        self._schedule(0.15, self._refresh_tp_state)
+
+    def _pipe_set(self, color: str, idx: int, enable: bool):
+        color = str(color or "").lower()
+        if color not in ("red", "blue"):
+            return
+        state = "on" if enable else "off"
+        self._send("pipeset", f"{color} {int(idx)} {state}")
+        self._schedule(0.15, self._refresh_puzzles)
+
+    def _pipe_all(self, enable: bool):
+        state = "on" if enable else "off"
+        self._send("pipeall", state)
+        self._schedule(0.15, self._refresh_puzzles)
+
+    def _airlock_set(self, idx: int, enable: bool):
+        state = "on" if enable else "off"
+        self._send("labairlockset", f"{int(idx)} {state}")
+        self._schedule(0.15, self._refresh_puzzles)
+
+    def _airlock_all(self, enable: bool):
+        state = "on" if enable else "off"
+        self._send("labairlockset", f"all {state}")
+        self._schedule(0.15, self._refresh_puzzles)
 
     def _tp_nearest(self):
         obj_type = str(self.tp_near_combo.currentData() or "").upper()
@@ -1272,7 +1702,7 @@ class ActionPanel(QWidget):
             if QMessageBox.question(self, "Confirm", "Teleport to nearest Monster?") != QMessageBox.Yes:
                 return
         self._send("tpnearest", obj_type)
-        QTimer.singleShot(150, self._refresh_tp_state)
+        self._schedule(0.15, self._refresh_tp_state)
 
     def _tp_bring_nearest(self):
         obj_type = str(self.tp_near_combo.currentData() or "").upper()
@@ -1280,18 +1710,39 @@ class ActionPanel(QWidget):
             if QMessageBox.question(self, "Confirm", "Bring nearest Monster to you?") != QMessageBox.Yes:
                 return
         self._send("bringnearest", obj_type)
-        QTimer.singleShot(150, self._refresh_tp_state)
+        self._schedule(0.15, self._refresh_tp_state)
 
     def _tp_bring_all(self):
         self._send("bringallplayers", "")
-        QTimer.singleShot(150, self._refresh_tp_state)
+        self._schedule(0.15, self._refresh_tp_state)
 
     def _tp_all_players(self):
         key = self.tp_all_combo.currentData()
         if not key:
             return
         self._send("tpallmap", str(key))
-        QTimer.singleShot(150, self._refresh_tp_state)
+        self._schedule(0.15, self._refresh_tp_state)
+
+    def _run_invoked(self, fn):
+        try:
+            fn()
+        except Exception:
+            pass
+
+    def _schedule(self, delay_s: float, fn):
+        try:
+            delay = max(0.0, float(delay_s))
+        except Exception:
+            delay = 0.0
+        if delay <= 0:
+            self._invoke.emit(fn)
+            return
+        try:
+            t = threading.Timer(delay, lambda: self._invoke.emit(fn))
+            t.daemon = True
+            t.start()
+        except Exception:
+            self._invoke.emit(fn)
 
 
 class OverlayApp:
@@ -1307,11 +1758,6 @@ class OverlayApp:
                 keyboard.add_hotkey("f1", self.toggle_panel)
             except Exception:
                 pass
-
-        self._tick = QTimer()
-        self._tick.setInterval(1000)
-        self._tick.timeout.connect(lambda: None)
-        self._tick.start()
 
     def toggle_panel(self):
         if self.panel.isVisible():
