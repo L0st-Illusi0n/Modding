@@ -21,12 +21,14 @@ local Util     = load_local("util.lua") or {}
 local Pointers = load_local("pointers.lua") or {}
 local Teleport = load_local("teleport.lua") or {}
 local Commands = load_local("commands.lua") or {}
+local Registry = load_local("registry.lua") or {}
 
 _G.BlackboxRecode = _G.BlackboxRecode or {}
 _G.BlackboxRecode.Util     = Util
 _G.BlackboxRecode.Pointers = Pointers
 _G.BlackboxRecode.Teleport = Teleport
 _G.BlackboxRecode.Commands = Commands
+_G.BlackboxRecode.Registry = Registry
 
 if Util.log then
     Util.log("[BlackboxRecode] Loaded. Initializing modules...")
@@ -39,9 +41,13 @@ if Teleport and Teleport.init then
 end
 
 if Commands and Commands.init then
-    Commands.init(Util, Pointers, Teleport)
+    Commands.init(Util, Pointers, Teleport, Registry)
 else
-    print("[BlackboxRecode] commands.lua missing Commands.init(Util, Pointers, Teleport)")
+    print("[BlackboxRecode] commands.lua missing Commands.init(Util, Pointers, Teleport, Registry)")
+end
+
+if Registry and Registry.init then
+    Registry.init(Util, Pointers, Teleport)
 end
 
 local function _external_dir()
@@ -55,6 +61,7 @@ local BRIDGE_DIR = _external_dir()
 local BRIDGE_CMD_PATH = BRIDGE_DIR .. "bridge_cmd.txt"
 local BRIDGE_ACK_PATH = BRIDGE_DIR .. "bridge_ack.txt"
 local BRIDGE_NOTICE_PATH = BRIDGE_DIR .. "bridge_notice.txt"
+local BRIDGE_REGISTRY_PATH = BRIDGE_DIR .. "bridge_registry.txt"
 
 local function _bridge_read_all(path)
     local f = io.open(path, "r")
@@ -140,6 +147,8 @@ local function _bridge_parse_cmd(line)
     return "", name, ""
 end
 
+local _registry_tick
+
 local function _bridge_exec_cmd(line)
     if not Commands or not Commands.run then
         return
@@ -160,6 +169,9 @@ local function _bridge_exec_cmd(line)
     _bridge_ack(id, ok, res or "")
     if name == "listplayers_gui" and _emit_tp_notice then
         _emit_tp_notice(true)
+    end
+    if name == "world_registry_scan" then
+        _registry_tick(true)
     end
 end
 
@@ -210,6 +222,60 @@ local function _emit_puzzles_notice()
             _bridge_ack("0", true, res)
         end
     end
+end
+
+local LAST_REGISTRY_TEXT = ""
+local LAST_REGISTRY_TIME = 0
+local REGISTRY_BRIDGE_COOLDOWN = 0.15
+
+local function _bridge_registry(text)
+    text = tostring(text or "")
+    if text == "" then return end
+    local now = (Util and Util.now_time and Util.now_time()) or os.clock()
+    if text == LAST_REGISTRY_TEXT and (now - LAST_REGISTRY_TIME) < REGISTRY_BRIDGE_COOLDOWN then
+        return
+    end
+    LAST_REGISTRY_TEXT = text
+    LAST_REGISTRY_TIME = now
+    local f = io.open(BRIDGE_REGISTRY_PATH, "w")
+    if f then
+        f:write(text .. "\n")
+        f:close()
+    end
+end
+
+_registry_tick = function(force_emit)
+    if not Registry or not Registry.tick then return end
+    local payload = Registry.tick(force_emit)
+    if payload and payload:find("^WORLD=") then
+        _bridge_registry(payload)
+    end
+end
+
+local function _registry_track(obj)
+    if not Registry or not Registry.track then return end
+    if Registry.track(obj) and Registry.request_emit then
+        Registry.request_emit(false)
+    end
+end
+
+local function _registry_untrack(obj)
+    if not Registry or not Registry.untrack then return end
+    if Registry.untrack(obj) and Registry.request_emit then
+        Registry.request_emit(false)
+    end
+end
+
+local REGISTRY_TICK_INTERVAL = 0.30
+local _last_registry_tick = 0
+
+local function _registry_tick_throttled(force_emit)
+    local now = (Util and Util.now_time and Util.now_time()) or os.clock()
+    if not force_emit and (now - _last_registry_tick) < REGISTRY_TICK_INTERVAL then
+        return
+    end
+    _last_registry_tick = now
+    _registry_tick(force_emit)
 end
 
 local function _hook_print(cat, fn)
@@ -301,6 +367,7 @@ end
 _start_bridge_loop()
 
 _G.BlackboxRecode.BridgeNotice = _bridge_notice
+_G.BlackboxRecode.BridgeRegistry = _bridge_registry
 
 local player_hooks = {
     "/Script/Engine.PlayerController:ClientRestart",
@@ -366,11 +433,51 @@ for _, fn in ipairs(puzzle_generic_hooks) do
     end)
 end
 
+local world_generic_hooks = {
+    "/Script/Engine.Actor:ReceiveBeginPlay",
+    "/Script/Engine.Actor:EndPlay",
+    "/Script/Engine.Actor:ReceiveDestroyed",
+}
+
+for _, fn in ipairs(world_generic_hooks) do
+    _try_register_hook(fn, function(self)
+        _hook_print("World", fn)
+        if fn:find("EndPlay", 1, true) or fn:find("Destroyed", 1, true) then
+            _registry_untrack(self)
+        else
+            _registry_track(self)
+        end
+    end)
+end
+
 if _G.NotifyOnNewObject then
     pcall(NotifyOnNewObject, "/Script/Engine.Actor", function(obj)
         local ok, short = _is_puzzle_actor(obj)
         if ok then
             _puzzle_bump("NewObject:" .. tostring(short))
         end
+        _registry_track(obj)
     end)
 end
+
+if _G.LoopAsync then
+    LoopAsync(300, function()
+        _registry_tick_throttled(false)
+        return false
+    end)
+else
+    local tick_hooks = {
+        "/Script/Engine.PlayerController:PlayerTick",
+        "/Script/Engine.PlayerController:Tick",
+        "/Script/Engine.Actor:Tick",
+    }
+    for _, fn in ipairs(tick_hooks) do
+        if _try_register_hook(fn, function()
+            _registry_tick_throttled(false)
+        end) then
+            break
+        end
+    end
+end
+
+_registry_tick_throttled(true)

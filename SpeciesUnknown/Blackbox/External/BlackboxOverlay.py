@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout,
     QFrame, QScrollArea, QLineEdit,
     QPushButton, QCheckBox, QComboBox,
-    QSlider, QMessageBox,
+    QSlider, QMessageBox, QListWidget, QListWidgetItem,
 )
 from PySide6.QtCore import Qt, QFileSystemWatcher, Signal
 
@@ -56,6 +56,7 @@ BASE_DIR = _base_dir()
 CMD_PATH = str(BASE_DIR / "bridge_cmd.txt")
 ACK_PATH = str(BASE_DIR / "bridge_ack.txt")
 NOTICE_PATH = str(BASE_DIR / "bridge_notice.txt")
+REGISTRY_PATH = str(BASE_DIR / "bridge_registry.txt")
 
 
 class CommandBridge:
@@ -87,7 +88,7 @@ class ActionPanel(QWidget):
         self._send_cmd = send_cmd_cb
         self.setObjectName("actionPanel")
         self.setWindowTitle("Blackbox Console")
-        self.setFixedSize(640, 820)
+        self.setFixedSize(720, 900)
         self.setWindowFlags(
             Qt.WindowStaysOnTopHint
             | Qt.FramelessWindowHint
@@ -171,6 +172,7 @@ class ActionPanel(QWidget):
 
         tp_layout = _make_tab("Teleport")
         player_layout = _make_tab("Player")
+        world_layout = _make_tab("World")
         puzzles_layout = _make_tab("Puzzles")
         debug_layout = _make_tab("Debug")
 
@@ -354,6 +356,97 @@ class ActionPanel(QWidget):
         tp_layout.addWidget(tp_unfinished)
         tp_layout.addStretch(1)
 
+        # ================== WORLD ==================
+        world_box = QFrame()
+        world_box.setObjectName("groupBox")
+        world_l = QVBoxLayout(world_box)
+        world_l.setContentsMargins(12, 10, 12, 10)
+        world_l.setSpacing(8)
+
+        world_hdr = QLabel("WORLD REGISTRY")
+        world_hdr.setObjectName("groupHeader")
+        world_l.addWidget(world_hdr)
+
+        world_row = QHBoxLayout()
+        self.world_refresh_btn = QPushButton("Refresh Registry")
+        self.world_refresh_btn.setObjectName("panelButton")
+        world_row.addWidget(self.world_refresh_btn)
+
+        self.world_count_lbl = QLabel("Items: 0")
+        self.world_count_lbl.setObjectName("panelChip")
+        world_row.addWidget(self.world_count_lbl)
+        world_row.addStretch(1)
+        world_l.addLayout(world_row)
+
+        world_filter_row = QHBoxLayout()
+        self.world_filter_combo = QComboBox()
+        self.world_filter_combo.setObjectName("panelCombo")
+        self.world_filter_combo.addItem("All", "ALL")
+        self.world_filter_combo.addItem("Monsters", "MONSTER")
+        self.world_filter_combo.addItem("Money", "MONEY")
+        self.world_filter_combo.addItem("Keycards", "OBJECTIVE")
+        self.world_filter_combo.addItem("Data Disks", "DATA")
+        self.world_filter_combo.addItem("Blackbox", "BLACKBOX")
+        self.world_filter_combo.addItem("Weapons", "WEAPON")
+        world_filter_row.addWidget(self.world_filter_combo, 1)
+
+        self.world_sort_combo = QComboBox()
+        self.world_sort_combo.setObjectName("panelCombo")
+        self.world_sort_combo.addItem("Sort: Category", "CATEGORY")
+        self.world_sort_combo.addItem("Sort: Distance", "DISTANCE")
+        self.world_sort_combo.addItem("Sort: Name", "NAME")
+        world_filter_row.addWidget(self.world_sort_combo, 1)
+        world_l.addLayout(world_filter_row)
+
+        self.world_list = QListWidget()
+        self.world_list.setObjectName("panelList")
+        self.world_list.setSelectionMode(QListWidget.SingleSelection)
+        world_l.addWidget(self.world_list, 1)
+
+        world_btns = QHBoxLayout()
+        self.world_tp_btn = QPushButton("Teleport To")
+        self.world_tp_btn.setObjectName("panelButtonPrimary")
+        world_btns.addWidget(self.world_tp_btn)
+
+        self.world_bring_btn = QPushButton("Bring To Me")
+        self.world_bring_btn.setObjectName("panelButton")
+        world_btns.addWidget(self.world_bring_btn)
+        world_l.addLayout(world_btns)
+
+        world_hint = QLabel("Event-driven registry. Refresh forces a full resync.")
+        world_hint.setObjectName("panelHint")
+        world_hint.setWordWrap(True)
+        world_l.addWidget(world_hint)
+
+        world_layout.addWidget(world_box)
+
+        world_unfinished = QFrame()
+        world_unfinished.setObjectName("groupBox")
+        world_unfinished_l = QVBoxLayout(world_unfinished)
+        world_unfinished_l.setContentsMargins(12, 10, 12, 10)
+        world_unfinished_l.setSpacing(8)
+
+        world_unfinished_hdr = QLabel("UNFINISHED")
+        world_unfinished_hdr.setObjectName("groupHeader")
+        world_unfinished_l.addWidget(world_unfinished_hdr)
+
+        self.world_unfinished_buttons = []
+        for label in (
+            "Object Highlighting / Ping (Unfinished)",
+            "Multi-Select Actions (Unfinished)",
+            "Bulk Bring / Teleport (Unfinished)",
+            "Advanced Filters (Unfinished)",
+            "Inspect Actor Properties (Unfinished)",
+        ):
+            btn = QPushButton(label)
+            btn.setObjectName("panelButton")
+            btn.setEnabled(False)
+            world_unfinished_l.addWidget(btn)
+            self.world_unfinished_buttons.append(btn)
+
+        world_layout.addWidget(world_unfinished)
+        world_layout.addStretch(1)
+
         # ================== PUZZLES ==================
         puzzles_top = QFrame()
         puzzles_top.setObjectName("groupBox")
@@ -434,6 +527,10 @@ class ActionPanel(QWidget):
                 off_btn.setObjectName("panelButton")
                 row.addWidget(off_btn, 0)
 
+                tp_btn = QPushButton("Teleport")
+                tp_btn.setObjectName("panelButton")
+                row.addWidget(tp_btn, 0)
+
                 col_l.addLayout(row)
                 self.pipe_rows.append({
                     "color": color_key,
@@ -442,6 +539,7 @@ class ActionPanel(QWidget):
                     "status": status,
                     "on": on_btn,
                     "off": off_btn,
+                    "tp": tp_btn,
                 })
 
             pipes_cols.addWidget(col_box, 1)
@@ -721,6 +819,13 @@ class ActionPanel(QWidget):
         self.walkspeed_apply_btn.clicked.connect(self._set_walkspeed)
         self.walkspeed_default_btn.clicked.connect(self._set_default_walkspeed)
 
+        self.world_refresh_btn.clicked.connect(self._refresh_world)
+        self.world_filter_combo.currentIndexChanged.connect(self._refresh_world_list)
+        self.world_sort_combo.currentIndexChanged.connect(self._refresh_world_list)
+        self.world_list.currentItemChanged.connect(self._update_world_actions)
+        self.world_tp_btn.clicked.connect(self._world_teleport)
+        self.world_bring_btn.clicked.connect(self._world_bring)
+
         self.tp_refresh_btn.clicked.connect(self._refresh_tp_state)
         self.tp_set_return_btn.clicked.connect(self._tp_set_return)
         self.tp_return_btn.clicked.connect(self._tp_return)
@@ -745,6 +850,9 @@ class ActionPanel(QWidget):
             )
             row["off"].clicked.connect(
                 lambda _=False, c=row["color"], i=row["idx"]: self._pipe_set(c, i, False)
+            )
+            row["tp"].clicked.connect(
+                lambda _=False, c=row["color"], i=row["idx"]: self._pipe_tp(c, i)
             )
         self.air_enable_all_btn.clicked.connect(lambda: self._airlock_all(True))
         self.air_disable_all_btn.clicked.connect(lambda: self._airlock_all(False))
@@ -789,6 +897,8 @@ class ActionPanel(QWidget):
             "air_found": False,
             "air_entries": [],
         }
+        self._world_entries = []
+        self._world_self_pos = None
         self._player_names = []
         self._self_name = None
         self._refresh_queue = []
@@ -809,6 +919,19 @@ class ActionPanel(QWidget):
         except Exception:
             pass
         self._notice_watcher.fileChanged.connect(self._on_notice_changed)
+
+        # Registry watcher (world registry updates)
+        self._registry_path = REGISTRY_PATH
+        self._registry_watcher = QFileSystemWatcher(self)
+        self._last_registry_line = ""
+        try:
+            if self._registry_path:
+                if not Path(self._registry_path).exists():
+                    Path(self._registry_path).write_text("", encoding="utf-8")
+                self._registry_watcher.addPath(self._registry_path)
+        except Exception:
+            pass
+        self._registry_watcher.fileChanged.connect(self._on_registry_changed)
 
         # Initial sync
         self._schedule(0.15, self._refresh_players)
@@ -911,6 +1034,19 @@ class ActionPanel(QWidget):
             QLabel#panelHint {
                 color: rgba(150, 130, 200, 210);
                 font-size: 10px;
+            }
+            QLabel#panelList, QListWidget#panelList {
+                background: rgba(8, 8, 14, 230);
+                border: 1px solid rgba(100, 80, 160, 140);
+                border-radius: 8px;
+                padding: 6px 8px;
+                font-size: 10px;
+            }
+            QListWidget#panelList::item {
+                padding: 4px 2px;
+            }
+            QListWidget#panelList::item:selected {
+                background: rgba(120, 90, 210, 140);
             }
             QComboBox#panelCombo {
                 background: rgba(8, 8, 14, 235);
@@ -1156,6 +1292,12 @@ class ActionPanel(QWidget):
         self._queue_ack(cmd_id, self._handle_puzzles_ack, 2.5)
         return True
 
+    def _refresh_world(self):
+        if self._ack_handlers:
+            return False
+        cmd_id = self._send("world_registry_scan", "")
+        return bool(cmd_id)
+
     def _queue_followup_refreshes(self):
         self._enqueue_refresh("tp")
         self._enqueue_refresh("puzzles")
@@ -1279,6 +1421,33 @@ class ActionPanel(QWidget):
         except Exception:
             pass
 
+    def _on_registry_changed(self, _path: str):
+        try:
+            if not self._registry_path:
+                return
+            p = Path(self._registry_path)
+            if not p.exists():
+                p.write_text("", encoding="utf-8")
+                self._registry_watcher.addPath(self._registry_path)
+                return
+            data = p.read_text(encoding="utf-8") if p.stat().st_size > 0 else ""
+        except Exception:
+            return
+
+        line = ""
+        for raw in (data or "").splitlines():
+            if raw.strip():
+                line = raw.strip()
+        if not line:
+            return
+        self._process_registry_line(line)
+
+        try:
+            if self._registry_path not in self._registry_watcher.files():
+                self._registry_watcher.addPath(self._registry_path)
+        except Exception:
+            pass
+
     def _process_notice_line(self, line: str):
         if not line:
             return
@@ -1295,6 +1464,16 @@ class ActionPanel(QWidget):
         elif line.startswith("PUZZLES="):
             payload = line[len("PUZZLES="):]
             self._apply_puzzles_state(payload)
+
+    def _process_registry_line(self, line: str):
+        if not line:
+            return
+        if line == self._last_registry_line:
+            return
+        self._last_registry_line = line
+        if line.startswith("WORLD="):
+            payload = line[len("WORLD="):]
+            self._apply_world_list(payload)
 
     def _apply_player_list(self, payload: str):
         entries = [e for e in str(payload or "").split(";") if e]
@@ -1575,6 +1754,216 @@ class ActionPanel(QWidget):
 
         self._update_puzzle_actions()
 
+    # ----------------- World Registry UI -----------------
+    def _apply_world_list(self, payload: str):
+        entries = []
+        self_pos = None
+        for raw in str(payload or "").split(";"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            parts = raw.split(",")
+            tag = parts[0].strip() if len(parts) > 0 else ""
+            code = parts[1].strip() if len(parts) > 1 else ""
+            name = parts[2].strip() if len(parts) > 2 else ""
+            x = parts[3].strip() if len(parts) > 3 else ""
+            y = parts[4].strip() if len(parts) > 4 else ""
+            z = parts[5].strip() if len(parts) > 5 else ""
+            entry_id = parts[6].strip() if len(parts) > 6 else ""
+            status = parts[7].strip() if len(parts) > 7 else ""
+
+            if tag.upper() == "SELF":
+                try:
+                    self_pos = {
+                        "x": float(x),
+                        "y": float(y),
+                        "z": float(z),
+                    }
+                except Exception:
+                    self_pos = None
+                continue
+
+            def _num(v):
+                try:
+                    return float(v)
+                except Exception:
+                    return None
+
+            entries.append({
+                "tag": tag.upper(),
+                "code": code,
+                "name": name,
+                "x": _num(x),
+                "y": _num(y),
+                "z": _num(z),
+                "id": entry_id,
+                "status": status.upper() if status else "UNKNOWN",
+            })
+
+        self._world_entries = entries
+        self._world_self_pos = self_pos
+        self.world_count_lbl.setText(f"Items: {len(entries)}")
+        self._refresh_world_list()
+
+    def _world_category_label(self, tag: str) -> str:
+        tag = str(tag or "").upper()
+        if tag == "MONSTER":
+            return "Monster"
+        if tag == "MONEY":
+            return "Money"
+        if tag == "OBJECTIVE":
+            return "Keycard"
+        if tag == "DATA":
+            return "Data Disk"
+        if tag == "BLACKBOX":
+            return "Blackbox"
+        if tag == "WEAPON":
+            return "Weapon"
+        return tag.title() if tag else "Unknown"
+
+    def _world_category_order(self, tag: str) -> int:
+        order = {
+            "MONSTER": 1,
+            "MONEY": 2,
+            "OBJECTIVE": 3,
+            "DATA": 4,
+            "BLACKBOX": 5,
+            "WEAPON": 6,
+        }
+        return order.get(str(tag or "").upper(), 99)
+
+    def _world_distance(self, entry) -> float | None:
+        if not entry or not self._world_self_pos:
+            return None
+        try:
+            if entry.get("x") is None or entry.get("y") is None or entry.get("z") is None:
+                return None
+            dx = entry.get("x") - self._world_self_pos.get("x", 0)
+            dy = entry.get("y") - self._world_self_pos.get("y", 0)
+            dz = entry.get("z") - self._world_self_pos.get("z", 0)
+            return (dx * dx + dy * dy + dz * dz) ** 0.5
+        except Exception:
+            return None
+
+    def _world_filter_tag(self) -> str:
+        if not self.world_filter_combo:
+            return "ALL"
+        return str(self.world_filter_combo.currentData() or "ALL").upper()
+
+    def _world_sort_mode(self) -> str:
+        if not self.world_sort_combo:
+            return "CATEGORY"
+        return str(self.world_sort_combo.currentData() or "CATEGORY").upper()
+
+    def _refresh_world_list(self, *_args):
+        if not self.world_list:
+            return
+        selected_id = None
+        current_item = self.world_list.currentItem()
+        if current_item:
+            selected_id = current_item.data(Qt.UserRole)
+
+        tag_filter = self._world_filter_tag()
+        entries = []
+        for e in self._world_entries:
+            if tag_filter != "ALL" and str(e.get("tag") or "").upper() != tag_filter:
+                continue
+            entries.append(e)
+
+        sort_mode = self._world_sort_mode()
+        if sort_mode == "DISTANCE":
+            entries.sort(key=lambda e: (self._world_distance(e) is None,
+                                        self._world_distance(e) or 0,
+                                        str(e.get("name") or "").lower()))
+        elif sort_mode == "NAME":
+            entries.sort(key=lambda e: str(e.get("name") or "").lower())
+        else:
+            entries.sort(key=lambda e: (self._world_category_order(e.get("tag")),
+                                        str(e.get("name") or "").lower()))
+
+        self.world_list.blockSignals(True)
+        self.world_list.clear()
+        if not entries:
+            item = QListWidgetItem("No world items registered.")
+            item.setFlags(item.flags() & ~Qt.ItemIsSelectable & ~Qt.ItemIsEnabled)
+            self.world_list.addItem(item)
+        else:
+            for e in entries:
+                tag = e.get("tag") or "OBJECT"
+                code = e.get("code") or ""
+                name = e.get("name") or "Unknown"
+                status = e.get("status") or "Unknown"
+                dist = self._world_distance(e)
+                if str(status).lower() == "collected":
+                    dist_str = "N/A"
+                else:
+                    dist_str = f"{dist:.1f}m" if dist is not None else "N/A"
+                label = f"{name} | {self._world_category_label(tag)} | {dist_str} | {status}"
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, e.get("id") or "")
+                self.world_list.addItem(item)
+
+        if selected_id:
+            for i in range(self.world_list.count()):
+                it = self.world_list.item(i)
+                if it and it.data(Qt.UserRole) == selected_id:
+                    self.world_list.setCurrentItem(it)
+                    break
+        self.world_list.blockSignals(False)
+        self._update_world_actions()
+
+    def _get_selected_world_entry(self):
+        item = self.world_list.currentItem() if self.world_list else None
+        if not item:
+            return None
+        sel_id = item.data(Qt.UserRole)
+        if not sel_id:
+            return None
+        for e in self._world_entries:
+            if e.get("id") == sel_id:
+                return e
+        return None
+
+    def _world_ready(self) -> bool:
+        return self._world_self_pos is not None
+
+    def _update_world_actions(self, *_args):
+        entry = self._get_selected_world_entry()
+        ready = self._world_ready()
+        valid = bool(entry)
+        status = str(entry.get("status") or "").lower() if entry else ""
+        can_use = ready and valid and status != "collected"
+        self.world_tp_btn.setEnabled(can_use)
+        self.world_bring_btn.setEnabled(can_use)
+
+    def _world_teleport(self):
+        entry = self._get_selected_world_entry()
+        if not entry:
+            return
+        if not self._world_ready():
+            return
+        if str(entry.get("tag") or "").upper() == "MONSTER":
+            if QMessageBox.question(self, "Confirm", "Teleport to selected Monster?") != QMessageBox.Yes:
+                return
+        obj_id = entry.get("id") or ""
+        if not obj_id:
+            return
+        self._send("world_tp", str(obj_id))
+
+    def _world_bring(self):
+        entry = self._get_selected_world_entry()
+        if not entry:
+            return
+        if not self._world_ready():
+            return
+        if str(entry.get("tag") or "").upper() == "MONSTER":
+            if QMessageBox.question(self, "Confirm", "Bring selected Monster to you?") != QMessageBox.Yes:
+                return
+        obj_id = entry.get("id") or ""
+        if not obj_id:
+            return
+        self._send("world_bring", str(obj_id))
+
     def _update_tp_actions(self):
         pawn_ok = bool(self._tp_state.get("pawn"))
         map_ok = pawn_ok and (self._tp_state.get("map") or "Unknown") != "Unknown"
@@ -1609,6 +1998,7 @@ class ActionPanel(QWidget):
         for row in self.pipe_rows:
             row["on"].setEnabled(pipe_found)
             row["off"].setEnabled(pipe_found)
+            row["tp"].setEnabled(pipe_found)
         self.pipes_enable_all_btn.setEnabled(pipe_found)
         self.pipes_disable_all_btn.setEnabled(pipe_found)
 
@@ -1680,6 +2070,12 @@ class ActionPanel(QWidget):
         state = "on" if enable else "off"
         self._send("pipeset", f"{color} {int(idx)} {state}")
         self._schedule(0.15, self._refresh_puzzles)
+
+    def _pipe_tp(self, color: str, idx: int):
+        color = str(color or "").lower()
+        if color not in ("red", "blue"):
+            return
+        self._send("pipegoto", f"{color} {int(idx)}")
 
     def _pipe_all(self, enable: bool):
         state = "on" if enable else "off"

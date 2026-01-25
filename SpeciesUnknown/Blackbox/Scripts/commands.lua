@@ -21,6 +21,7 @@ end
 local U = nil
 local P = nil
 local TP = nil
+local R = nil
 local open_contracts_active = false
 local start_contract_active = false
 local esc_bound = false
@@ -283,6 +284,10 @@ local function is_empty_name(s)
     if low:match("^fstring:%s*[0-9a-fx]+$") then return true end
     if low:match("^ftext:%s*[0-9a-fx]+$") then return true end
     if low:match("^fname:%s*[0-9a-fx]+$") then return true end
+    if low:match("^aactor%s+[%x]+$") then return true end
+    if low:match("^uobject%s+[%x]+$") then return true end
+    if low:match("^aactor%s+0x[%x]+$") then return true end
+    if low:match("^uobject%s+0x[%x]+$") then return true end
     return false
 end
 
@@ -690,6 +695,21 @@ local function get_valve_indices(obj)
     return tonumber(pidx), tonumber(vidx)
 end
 
+local function find_valve_by_set(set_idx, pipe_num)
+    local cls = (P and P.PIPES and P.PIPES.ValvePipe) or "BP_ValvePipe_C"
+    local valves = find_all(cls) or {}
+    for _, obj in ipairs(valves) do
+        if is_valid(obj) then
+            local pidx, vidx = get_valve_indices(obj)
+            local s, p = resolve_pipe_indices(pidx, vidx)
+            if s == set_idx and p == pipe_num then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
 local function get_valve_on(obj)
     if not obj then return nil end
     local function read_prop(name)
@@ -957,6 +977,39 @@ local function get_actor_rotation(obj)
     local ok, rot = pcall(obj.K2_GetActorRotation, obj)
     if ok then return rot end
     return nil
+end
+
+local function get_rotation_yaw(rot)
+    if rot == nil then return nil end
+    for _, key in ipairs({ "Yaw", "yaw", "Z", "z" }) do
+        local ok, v = pcall(function() return rot[key] end)
+        if ok and type(v) == "number" then
+            return v
+        end
+    end
+    return nil
+end
+
+local function safe_offset_from_actor(loc, rot, dist, up)
+    dist = tonumber(dist) or 180
+    up = tonumber(up) or 80
+    if not loc then return nil end
+    local yaw = get_rotation_yaw(rot)
+    if yaw ~= nil then
+        local r = math.rad(yaw)
+        local fx = math.cos(r)
+        local fy = math.sin(r)
+        return {
+            X = (loc.X or 0) + fx * dist,
+            Y = (loc.Y or 0) + fy * dist,
+            Z = (loc.Z or 0) + up,
+        }
+    end
+    return {
+        X = (loc.X or 0) + dist,
+        Y = (loc.Y or 0),
+        Z = (loc.Z or 0) + up,
+    }
 end
 
 local function get_pawn_from_pc(pc)
@@ -1458,10 +1511,11 @@ local function print_tp_list(map_name)
     end
 end
 
-function Commands.init(Util, Pointers, Teleport)
+function Commands.init(Util, Pointers, Teleport, Registry)
     U = Util
     P = Pointers
     TP = Teleport
+    R = Registry
     if UEH == nil then
         local ok, mod = pcall(require, "UEHelpers")
         if ok then UEH = mod else UEH = false end
@@ -1763,6 +1817,101 @@ function Commands.init(Util, Pointers, Teleport)
         print("Player List Updated:", table.concat(out, ", "))
         return true, payload
     end, "GUI: returns player list string", "Players")
+
+    reg("world_registry_scan", function(args)
+        if R and R.full_rescan then
+            R.full_rescan()
+            if R.request_emit then
+                R.request_emit(true)
+            end
+        end
+        return true, "OK"
+    end, "GUI: rescan world registry (pushes bridge update)", "World")
+
+    reg("world_gui_state", function(args)
+        if not R then
+            return true, "WORLD="
+        end
+        local mode = args and args[1] and tostring(args[1]):lower() or ""
+        if mode == "scan" or mode == "refresh" or mode == "rescan" then
+            if R.full_rescan then R.full_rescan() end
+        end
+        if R.build_payload then
+            return true, R.build_payload()
+        end
+        return true, "WORLD="
+    end, "GUI: returns world registry list (use 'scan' to rescan)", "World")
+
+    reg("world_tp", function(args)
+        if not R or not R.get_entry_by_id then
+            print("[world_tp] Registry not loaded.")
+            return true
+        end
+        if not TP or not TP.teleport_to_location then
+            print("[world_tp] Teleport module not loaded.")
+            return true
+        end
+        if not args or #args < 1 then
+            print("[world_tp] Usage: world_tp <id>")
+            return true
+        end
+        local id = tostring(args[1] or "")
+        local entry = R.get_entry_by_id(id)
+        if not entry or not entry.obj or not is_valid(entry.obj) then
+            print("[world_tp] Object not found.")
+            return true
+        end
+        local loc = get_actor_location(entry.obj)
+        if not loc then
+            if entry.x and entry.y and entry.z then
+                loc = { X = entry.x, Y = entry.y, Z = entry.z }
+            end
+        end
+        if not loc then
+            print("[world_tp] No object location.")
+            return true
+        end
+        if TP.save_local_return then
+            TP.save_local_return()
+        end
+        local ok, msg = TP.teleport_to_location({ x = loc.X or 0, y = loc.Y or 0, z = loc.Z or 0 })
+        print(ok and "[world_tp] OK" or ("[world_tp] FAIL -> " .. tostring(msg)))
+        return true
+    end, "world_tp <id> -> teleport to registry object", "World")
+
+    reg("world_bring", function(args)
+        if not R or not R.get_entry_by_id then
+            print("[world_bring] Registry not loaded.")
+            return true
+        end
+        if not TP or not TP.teleport_to_location then
+            print("[world_bring] Teleport module not loaded.")
+            return true
+        end
+        if not args or #args < 1 then
+            print("[world_bring] Usage: world_bring <id>")
+            return true
+        end
+        local id = tostring(args[1] or "")
+        local entry = R.get_entry_by_id(id)
+        if not entry or not entry.obj or not is_valid(entry.obj) then
+            print("[world_bring] Object not found.")
+            return true
+        end
+        local pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+        if not pawn then
+            print("[world_bring] No local pawn.")
+            return true
+        end
+        local loc = get_actor_location(pawn)
+        if not loc then
+            print("[world_bring] No local location.")
+            return true
+        end
+        local ok, msg = TP.teleport_to_location({ x = loc.X or 0, y = loc.Y or 0, z = loc.Z or 0 }, entry.obj, false)
+        print(ok and "[world_bring] OK" or ("[world_bring] FAIL -> " .. tostring(msg)))
+        return true
+    end, "world_bring <id> -> bring registry object to you", "World")
 
     reg("gotoplayer", function(args)
         if not TP or not TP.teleport_to_location then
@@ -2385,6 +2534,43 @@ function Commands.init(Util, Pointers, Teleport)
         print(ok and ("[pipeset] OK -> " .. color .. " " .. idx .. " " .. (enable and "on" or "off")) or "[pipeset] Failed (terminal not found?)")
         return true
     end, "pipeset <red|blue> <1-8> <on|off> -> sets one pipe via terminal", "Pipes")
+
+    reg("pipegoto", function(args)
+        if not TP or not TP.teleport_to_location then
+            print("[pipegoto] Teleport module not loaded.")
+            return true
+        end
+        if not args or #args < 2 then
+            print("[pipegoto] Usage: pipegoto <red|blue> <1-8>")
+            return true
+        end
+        local color = tostring(args[1] or ""):lower()
+        local idx = tonumber(args[2])
+        if (color ~= "red" and color ~= "blue") or not idx or idx < 1 or idx > 8 then
+            print("[pipegoto] Usage: pipegoto <red|blue> <1-8>")
+            return true
+        end
+        local pipe_set = (color == "red") and 2 or 1
+        local obj = find_valve_by_set(pipe_set, idx)
+        if not obj then
+            print("[pipegoto] Valve not found.")
+            return true
+        end
+        local loc = get_actor_location(obj)
+        if not loc then
+            print("[pipegoto] No valve location.")
+            return true
+        end
+        local rot = get_actor_rotation(obj)
+        local safe = safe_offset_from_actor(loc, rot, 180, 80)
+        local ok, msg = TP.teleport_to_location({
+            x = safe and safe.X or (loc.X or 0),
+            y = safe and safe.Y or (loc.Y or 0),
+            z = safe and safe.Z or (loc.Z or 0),
+        })
+        print(ok and "[pipegoto] OK" or ("[pipegoto] FAIL -> " .. tostring(msg)))
+        return true
+    end, "pipegoto <red|blue> <1-8> -> teleport to valve", "Pipes")
 
     reg("pipestatus", function(args)
         local term = get_pipe_terminal()
@@ -3040,7 +3226,7 @@ function Commands.init(Util, Pointers, Teleport)
     Commands.actions.teleport_list = Commands.actions.tplist
 
     print("[BlackboxRecode] Commands loaded:",
-        "checkcommands, getmap, getpos, hookprints, testsocket, tp, tplist, returnself, returnall, listreturns, tpsetreturn, tpreturn, tpmap, tpallmap, bringallplayers, tpnearest, bringnearest, tp_gui_state, opencontracts, startcontract, listplayers, listplayers_gui, gotoplayer, bringplayer, tpplayerto, heal, god, stamina, battery, walkspeed, sethp, setmaxhp, invisible, pipeall, pipeset, pipestatus, labairlockstatus, labairlockset, puzzlestate, activateselfdestruct, gotoitem, bringitem, gotoweapon, bringweapon, gotomonster, bringmonster, listmonsters, removemonster, setweapondmg, unlimitedammo, maxammo, help")
+        "checkcommands, getmap, getpos, hookprints, testsocket, tp, tplist, returnself, returnall, listreturns, tpsetreturn, tpreturn, tpmap, tpallmap, bringallplayers, tpnearest, bringnearest, tp_gui_state, opencontracts, startcontract, listplayers, listplayers_gui, world_registry_scan, world_gui_state, world_tp, world_bring, gotoplayer, bringplayer, tpplayerto, heal, god, stamina, battery, walkspeed, sethp, setmaxhp, invisible, pipeall, pipeset, pipegoto, pipestatus, labairlockstatus, labairlockset, puzzlestate, activateselfdestruct, gotoitem, bringitem, gotoweapon, bringweapon, gotomonster, bringmonster, listmonsters, removemonster, setweapondmg, unlimitedammo, maxammo, help")
 end
 
 return Commands

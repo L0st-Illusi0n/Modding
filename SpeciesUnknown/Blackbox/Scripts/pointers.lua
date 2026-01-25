@@ -155,10 +155,11 @@ P.TELEPORTS = {
     end)(),
     Main = (function()
         local TP_MAIN = {
-    ship       = { name = "Ship",       pos = { x = 10625,  y = 6000, z = -350 } },
-    command    = { name = "Command",    pos = { x = 7540,   y = -0.4, z = 1300 } },
-    crewserver = { name = "CrewServer", pos = { x = -3300,  y = 6420, z = -200 } },
-    engines    = { name = "Engines",    pos = { x = -14730, y = 2,    z = 200 } },
+    ship = {name="Ship", pos={x=10625, y=6000, z=-350}},
+    command = {name="Command Deck", pos={x=7540, y=-0.4, z=1300}},
+    crewserver = {name="Crew Server Room", pos={x=-3300, y=6420, z=-200}},
+    engines = {name="Engines Terminal", pos={x=-14730, y=2, z=200}},
+    reactor = {name="Reactor Terminal", pos={x=-9200, y=1468, z=97.15}},
 }
         local out = {}
         for k, v in pairs(TP_MAIN) do
