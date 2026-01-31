@@ -6,158 +6,37 @@ local Teleport = {}
 local U = nil
 local P = nil
 local UEH = nil
+local is_valid = _G.is_valid
+local is_world_actor = _G.is_world_actor
+local find_all = _G.find_all
 
 -- simple caches (keep tiny for now)
-local CACHED_MAP = "Unknown"
-local CACHED_MAP_TIME = 0
 local MAP_CACHE_TTL = 0.50
 
-local CACHED_PC = nil
-local CACHED_PC_TIME = 0
 local PC_CACHE_TTL = 0.50
 
-local CACHED_PAWN = nil
-local CACHED_PAWN_TIME = 0
 local PAWN_CACHE_TTL = 0.25
 
 local RETURN_POSITIONS = {}
 
-local function now_time()
-    return (U and U.now_time and U.now_time()) or os.clock()
-end
-
-local function is_valid(obj)
-    if not obj then return false end
-    if obj.IsValid then
-        local ok, v = pcall(obj.IsValid, obj)
-        return ok and v
-    end
-    return true
-end
-
-local function is_world_actor(actor)
-    if not is_valid(actor) then return false end
-    if actor.GetWorld then
-        local ok, world = pcall(actor.GetWorld, actor)
-        if ok and world == nil then
-            return false
-        end
-    end
-    return true
-end
-
-local function find_all(class_name)
-    if not class_name or class_name == "" then return nil end
-
-    if _G.FindAllOf then
-        local ok, res = pcall(_G.FindAllOf, class_name)
-        if ok then return res end
-    end
-    if _G.UE and UE.FindAllOf then
-        local ok, res = pcall(UE.FindAllOf, class_name)
-        if ok then return res end
-    end
-    return nil
-end
-
 local function get_local_controller()
-    local now = now_time()
-    if CACHED_PC and (now - CACHED_PC_TIME) < PC_CACHE_TTL and is_valid(CACHED_PC) then
-        return CACHED_PC
+    if U and U.get_local_controller then
+        return U.get_local_controller({ ttl = PC_CACHE_TTL })
     end
-
-    -- If UE4SS exposes a helper, prefer it.
-    if _G.UE and UE.GetLocalPlayerController then
-        local ok, pc = pcall(UE.GetLocalPlayerController)
-        if ok and is_valid(pc) then
-            CACHED_PC = pc
-            CACHED_PC_TIME = now
-            return pc
-        end
-    end
-
-    local cls = (P and (P.CLASSES and P.CLASSES.PlayerController)) or "BP_MyPlayerController_C"
-    local controllers = find_all(cls)
-    if controllers then
-        for _, pc in ipairs(controllers) do
-            if is_valid(pc) and (pc.NetTag or 0) == 0 then
-                CACHED_PC = pc
-                CACHED_PC_TIME = now
-                return pc
-            end
-        end
+    if _G.get_local_controller then
+        return _G.get_local_controller({ ttl = PC_CACHE_TTL })
     end
     return nil
 end
 
 function Teleport.get_current_map()
-    local now = now_time()
-    if (now - CACHED_MAP_TIME) < MAP_CACHE_TTL then
-        return CACHED_MAP
+    if U and U.get_current_map then
+        return U.get_current_map({ ttl = MAP_CACHE_TTL })
     end
-
-    local pc = get_local_controller()
-    local new_map = "Unknown"
-    if pc and pc.GetFullName then
-        local ok, full = pcall(pc.GetFullName, pc)
-        if ok and full then
-            local low = tostring(full):lower()
-            local markers = (P and P.MAPS and P.MAPS.PackageMarkers) or {}
-            for map_name, list in pairs(markers) do
-                if type(list) == "table" then
-                    for _, mk in ipairs(list) do
-                        mk = tostring(mk)
-                        if mk ~= "" then
-                            if tostring(full):find(mk, 1, true) or low:find(mk:lower(), 1, true) then
-                                new_map = tostring(map_name)
-                                break
-                            end
-                        end
-                    end
-                end
-                if new_map ~= "Unknown" then break end
-            end
-        end
+    if _G.get_current_map then
+        return _G.get_current_map({ ttl = MAP_CACHE_TTL })
     end
-
-    if new_map == "Unknown" and UEH and UEH.GetWorld then
-        local world = UEH.GetWorld()
-        if world and world.IsValid and world:IsValid() then
-            local name = nil
-            if world.GetMapName then
-                local ok, n = pcall(world.GetMapName, world)
-                if ok then name = n end
-            end
-            if (not name or name == "") and world.GetName then
-                local ok, n = pcall(world.GetName, world)
-                if ok then name = n end
-            end
-            if (not name or name == "") and world.GetFullName then
-                local ok, n = pcall(world.GetFullName, world)
-                if ok then name = n end
-            end
-            if name then
-                local low = tostring(name):lower()
-                local markers = (P and P.MAPS and P.MAPS.PackageMarkers) or {}
-                for map_name, list in pairs(markers) do
-                    if type(list) == "table" then
-                        for _, mk in ipairs(list) do
-                            mk = tostring(mk)
-                            if mk ~= "" and (tostring(name):find(mk, 1, true) or low:find(mk:lower(), 1, true)) then
-                                new_map = tostring(map_name)
-                                break
-                            end
-                        end
-                    end
-                    if new_map ~= "Unknown" then break end
-                end
-            end
-        end
-    end
-
-    CACHED_MAP = new_map
-    CACHED_MAP_TIME = now
-    return CACHED_MAP
+    return "Unknown"
 end
 
 local function get_tp_table(map_name)
@@ -166,60 +45,11 @@ local function get_tp_table(map_name)
 end
 
 local function get_local_pawn()
-    local now = now_time()
-    if CACHED_PAWN and (now - CACHED_PAWN_TIME) < PAWN_CACHE_TTL and is_world_actor(CACHED_PAWN) then
-        return CACHED_PAWN
+    if U and U.get_local_pawn then
+        return U.get_local_pawn({ ttl = PAWN_CACHE_TTL })
     end
-
-    local pc = get_local_controller()
-    if not pc then return nil end
-
-    local pawn = nil
-    if pc.K2_GetPawn then
-        local ok, pwn = pcall(pc.K2_GetPawn, pc)
-        if ok then pawn = pwn end
-    end
-    if pawn and is_world_actor(pawn) then
-        CACHED_PAWN = pawn
-        CACHED_PAWN_TIME = now
-        return pawn
-    end
-
-    -- Fallback: detect local character by class (Lobby/Main), when controller pawn is unset.
-    local function find_local_character(class_name)
-        if not class_name or class_name == "" then return nil end
-        local chars = find_all(class_name)
-        if not chars then return nil end
-        for _, ch in ipairs(chars) do
-            if is_world_actor(ch) then
-                local ok_full, full = true, nil
-                if ch.GetFullName then
-                    ok_full, full = pcall(ch.GetFullName, ch)
-                end
-                if (not ok_full) or (full == nil) or tostring(full):find("PersistentLevel", 1, true) then
-                    if (ch.NetTag or 0) == 0 then
-                        return ch
-                    end
-                end
-            end
-        end
-        return nil
-    end
-
-    local map = Teleport.get_current_map()
-    local lobby_cls = (P and P.CLASSES and P.CLASSES.LobbyCharacter) or "BP_Character_Lobby_C"
-    local main_cls = (P and P.CLASSES and P.CLASSES.MainCharacter) or "BP_Character_C"
-    if map == "Lobby" then
-        pawn = find_local_character(lobby_cls)
-    elseif map == "Main" then
-        pawn = find_local_character(main_cls)
-    else
-        pawn = find_local_character(lobby_cls) or find_local_character(main_cls)
-    end
-    if pawn then
-        CACHED_PAWN = pawn
-        CACHED_PAWN_TIME = now
-        return pawn
+    if _G.get_local_pawn then
+        return _G.get_local_pawn({ ttl = PAWN_CACHE_TTL })
     end
     return nil
 end
@@ -463,6 +293,9 @@ end
 function Teleport.init(Util, Pointers)
     U = Util
     P = Pointers
+    if not is_valid and U and U.is_valid then is_valid = U.is_valid end
+    if not is_world_actor and U and U.is_world_actor then is_world_actor = U.is_world_actor end
+    if not find_all and U and U.find_all then find_all = U.find_all end
     if UEH == nil then
         local ok, mod = pcall(require, "UEHelpers")
         if ok then UEH = mod else UEH = false end

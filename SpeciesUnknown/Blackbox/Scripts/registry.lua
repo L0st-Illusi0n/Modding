@@ -6,11 +6,21 @@ local Registry = {}
 local U = nil
 local P = nil
 local TP = nil
+local is_valid = _G.is_valid
+local is_world_actor = _G.is_world_actor
+local find_all = _G.find_all
+local trim = _G.trim
+local get_local_pawn = _G.get_local_pawn
 
 local REGISTRY = {
     by_tag = {},
+    by_obj = setmetatable({}, { __mode = "k" }),
+    by_uid = {},
     by_id = {},
+    id_by_obj = setmetatable({}, { __mode = "k" }),
+    uid_by_obj = setmetatable({}, { __mode = "k" }),
     rules = {},
+    rule_by_class = {},
     dirty = true,
     emit_requested = false,
     force_emit = false,
@@ -20,58 +30,100 @@ local REGISTRY = {
     last_rescan = 0,
     initial_scan_done = false,
     self_pos = nil,
+    alias_by_class = nil,
+    next_id = 1,
+    pending = {},
+    pending_set = setmetatable({}, { __mode = "k" }),
+    name_queue = {},
+    name_queue_set = setmetatable({}, { __mode = "k" }),
+    scan_jobs = {},
+    scan_job_idx = 1,
+    scan_list = nil,
+    scan_list_idx = 1,
+    scan_active = false,
+    scan_seen = nil,
+    ready_since = nil,
 }
 
 local EMIT_COOLDOWN = 0.25
 local PRUNE_INTERVAL = 1.0
-local RESCAN_INTERVAL = 0.0
+local RESCAN_INTERVAL = 20.0
+local SCAN_BATCH_MAX = 120
+local TRACK_BATCH_MAX = 80
+local NAME_BATCH_MAX = 40
+local CLASSIFY_DELAY = 0.25
+local NAME_DELAY = 0.6
+local MAX_CLASSIFY_ATTEMPTS = 4
+local MAX_NAME_ATTEMPTS = 6
+local READY_SCAN_DELAY = 0.8
 
 local function now_time()
     return (U and U.now_time and U.now_time()) or os.clock()
 end
 
-local function is_valid(obj)
-    if not obj then return false end
-    if obj.IsValid then
-        local ok, v = pcall(obj.IsValid, obj)
-        return ok and v
+local function _alloc_id(obj)
+    local existing = REGISTRY.id_by_obj[obj]
+    if existing then
+        return existing
     end
-    return true
+    local id = REGISTRY.next_id or 1
+    REGISTRY.next_id = id + 1
+    REGISTRY.id_by_obj[obj] = id
+    return id
 end
 
-local function is_world_actor(actor)
-    if not is_valid(actor) then return false end
-    if actor.GetWorld then
-        local ok, world = pcall(actor.GetWorld, actor)
-        if ok and world == nil then
-            return false
-        end
-    end
-    return true
-end
-
-local function find_all(class_name)
-    if not class_name or class_name == "" then return nil end
-    if _G.FindAllOf then
-        local ok, res = pcall(_G.FindAllOf, class_name)
-        if ok then return res end
-    end
-    if _G.UE and UE.FindAllOf then
-        local ok, res = pcall(UE.FindAllOf, class_name)
-        if ok then return res end
+local function _get_class_name(obj)
+    if not obj or not obj.GetClass then return nil end
+    local ok, cls = pcall(obj.GetClass, obj)
+    if not ok or not cls or not cls.GetName then return nil end
+    local okn, name = pcall(cls.GetName, cls)
+    if okn and name then
+        return tostring(name)
     end
     return nil
 end
 
-local function object_key(obj)
+local function _get_uid(obj)
     if not obj then return nil end
-    if obj.GetFullName then
-        local ok, full = pcall(obj.GetFullName, obj)
-        if ok and full and full ~= "" then
-            return tostring(full)
+    local fn = obj.GetUniqueID
+    if type(fn) == "function" then
+        local ok, v = pcall(fn, obj)
+        if ok and v ~= nil then
+            local n = tonumber(v)
+            if n and n > 0 then return n end
         end
     end
-    return tostring(obj)
+    local ok_prop, vprop = pcall(function() return obj.UniqueID end)
+    if ok_prop then
+        local n = tonumber(vprop)
+        if n and n > 0 then return n end
+    end
+    local ok_idx, v_idx = pcall(function() return obj.InternalIndex end)
+    if ok_idx then
+        local n = tonumber(v_idx)
+        if n and n > 0 then return n end
+    end
+    return nil
+end
+
+local function _get_uid_cached(obj)
+    local cached = REGISTRY.uid_by_obj[obj]
+    if cached then
+        return cached
+    end
+    local uid = _get_uid(obj)
+    if uid then
+        REGISTRY.uid_by_obj[obj] = uid
+    end
+    return uid
+end
+
+local function _find_entry(obj)
+    local uid = _get_uid_cached(obj)
+    if uid then
+        return REGISTRY.by_uid[uid], uid
+    end
+    return REGISTRY.by_obj[obj], nil
 end
 
 local function get_actor_location(obj)
@@ -108,6 +160,10 @@ local function coerce_string(v)
         if v.String and type(v.String) == "string" then
             return v.String
         end
+        if t == "table" then
+            return tostring(v)
+        end
+        return nil
     end
     return tostring(v)
 end
@@ -121,19 +177,7 @@ local function get_actor_name(obj)
             if n and n ~= "" then return n end
         end
     end
-    if obj.GetFullName then
-        local ok, n = pcall(obj.GetFullName, obj)
-        if ok and n ~= nil then
-            n = coerce_string(n)
-            if n and n ~= "" then return n end
-        end
-    end
-    return tostring(obj)
-end
-
-local function trim(s)
-    s = tostring(s or "")
-    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+    return "Unknown"
 end
 
 local function sanitize_token(s)
@@ -143,24 +187,28 @@ local function sanitize_token(s)
     return trim(s)
 end
 
-local function sanitize_id(s)
-    s = tostring(s or "")
-    s = s:gsub("[%s|,;\r\n]", "_")
-    s = s:gsub("_+", "_")
-    return trim(s)
-end
-
 local function is_bogus_location(x, y)
     return math.abs(x or 0) < 30 and math.abs(y or 0) < 30
 end
 
 local function add_rule(tag, short, code)
     if not short or short == "" then return end
+    local existing = REGISTRY.rule_by_class[short]
+    if existing then
+        if not existing.code and code then
+            existing.code = code
+        end
+        if not existing.tag and tag then
+            existing.tag = tag
+        end
+        return
+    end
     REGISTRY.rules[#REGISTRY.rules + 1] = {
         tag = tag,
         short = short,
         code = code,
     }
+    REGISTRY.rule_by_class[short] = { tag = tag, code = code, short = short }
 end
 
 local function humanize_key(key)
@@ -203,6 +251,7 @@ end
 
 local function rebuild_rules()
     REGISTRY.rules = {}
+    REGISTRY.rule_by_class = {}
 
     if P and P.CLASS_RULES then
         for _, rule in ipairs(P.CLASS_RULES) do
@@ -236,11 +285,21 @@ local function rebuild_rules()
     -- Pipes intentionally excluded from world registry
 end
 
-local function classify_full(full)
-    if not full or full == "" then return nil end
-    for _, rule in ipairs(REGISTRY.rules) do
-        if rule.short and full:find(rule.short, 1, true) then
-            return rule.tag, rule.code, rule.short
+local function classify_obj(obj)
+    if not obj then return nil end
+    local cls_name = _get_class_name(obj)
+    if cls_name and REGISTRY.rule_by_class[cls_name] then
+        local rule = REGISTRY.rule_by_class[cls_name]
+        return rule.tag, rule.code, rule.short
+    end
+    if obj.IsA then
+        for _, rule in ipairs(REGISTRY.rules) do
+            if rule.short then
+                local ok, v = pcall(obj.IsA, obj, rule.short)
+                if ok and v then
+                    return rule.tag, rule.code, rule.short
+                end
+            end
         end
     end
     return nil
@@ -278,11 +337,144 @@ local function update_location(entry, loc)
     return changed
 end
 
+local function _queue_pending(obj)
+    if REGISTRY.pending_set[obj] then return end
+    REGISTRY.pending_set[obj] = true
+    REGISTRY.pending[#REGISTRY.pending + 1] = {
+        obj = obj,
+        t = now_time(),
+        attempts = 0,
+    }
+end
+
+local function _queue_name(entry)
+    if not entry or not entry.obj then return end
+    local obj = entry.obj
+    if REGISTRY.name_queue_set[obj] then return end
+    REGISTRY.name_queue_set[obj] = true
+    REGISTRY.name_queue[#REGISTRY.name_queue + 1] = {
+        entry = entry,
+        t = now_time(),
+        attempts = 0,
+    }
+end
+
+local function _add_or_update_entry(obj, tag, code, short, now)
+    local entry, uid = _find_entry(obj)
+    local changed = false
+    local old_tag = entry and entry.tag or nil
+    local old_key = entry and entry.key or nil
+    if not entry then
+        entry = {}
+        REGISTRY.by_obj[obj] = entry
+        local id = uid or _alloc_id(obj)
+        entry.uid = uid
+        entry.id = tostring(id)
+        entry.key = entry.id
+        REGISTRY.by_id[entry.id] = entry
+        if uid then
+            REGISTRY.by_uid[uid] = entry
+        end
+        entry.name = "Unknown #" .. tostring(entry.id)
+        changed = true
+    else
+        if uid and not entry.uid then
+            entry.uid = uid
+            REGISTRY.by_uid[uid] = entry
+        end
+        if uid and tostring(uid) ~= entry.id then
+            if REGISTRY.by_id[entry.id] == entry then
+                REGISTRY.by_id[entry.id] = nil
+            end
+            entry.id = tostring(uid)
+            entry.key = entry.id
+            REGISTRY.by_id[entry.id] = entry
+            changed = true
+        end
+    end
+    if REGISTRY.by_obj[obj] ~= entry then
+        REGISTRY.by_obj[obj] = entry
+    end
+
+    if old_tag then
+        local old_reg = REGISTRY.by_tag[old_tag]
+        if old_reg and old_key and old_reg[old_key] == entry then
+            old_reg[old_key] = nil
+        end
+        if old_reg and entry.key and old_reg[entry.key] == entry and old_tag ~= tag then
+            old_reg[entry.key] = nil
+        end
+    end
+
+    local reg = get_tag_registry(tag)
+    if not entry.key then
+        entry.key = entry.id
+    end
+    if reg[entry.key] ~= entry then
+        reg[entry.key] = entry
+        changed = true
+    end
+
+    if entry.tag ~= tag then entry.tag = tag; changed = true end
+    if entry.code ~= code then entry.code = code; changed = true end
+    if entry.class ~= short then entry.class = short; changed = true end
+    entry.obj = obj
+    entry.last_seen = now or now_time()
+
+    if not entry.name_ready then
+        local alias = REGISTRY.alias_by_class and REGISTRY.alias_by_class[short] or nil
+        if alias and alias ~= "" then
+            if entry.name ~= alias then
+                entry.name = alias
+                changed = true
+            end
+            entry.name_ready = true
+        else
+            _queue_name(entry)
+        end
+    end
+
+    if REGISTRY.scan_active and REGISTRY.scan_seen then
+        REGISTRY.scan_seen[entry.key] = true
+        REGISTRY.scan_seen[obj] = true
+    end
+
+    local loc = get_actor_location(obj)
+    if update_location(entry, loc) then
+        changed = true
+    end
+
+    return entry, changed
+end
+
 function Registry.init(Util, Pointers, Teleport)
     U = Util
     P = Pointers
     TP = Teleport
+    if not is_valid and U and U.is_valid then is_valid = U.is_valid end
+    if not is_world_actor and U and U.is_world_actor then is_world_actor = U.is_world_actor end
+    if not find_all and U and U.find_all then find_all = U.find_all end
+    if not trim and U and U.trim then trim = U.trim end
+    if not get_local_pawn and U and U.get_local_pawn then get_local_pawn = U.get_local_pawn end
     rebuild_rules()
+    REGISTRY.by_obj = setmetatable({}, { __mode = "k" })
+    REGISTRY.by_uid = {}
+    REGISTRY.by_id = {}
+    REGISTRY.id_by_obj = setmetatable({}, { __mode = "k" })
+    REGISTRY.uid_by_obj = setmetatable({}, { __mode = "k" })
+    REGISTRY.pending = {}
+    REGISTRY.pending_set = setmetatable({}, { __mode = "k" })
+    REGISTRY.name_queue = {}
+    REGISTRY.name_queue_set = setmetatable({}, { __mode = "k" })
+    REGISTRY.scan_jobs = {}
+    REGISTRY.scan_job_idx = 1
+    REGISTRY.scan_list = nil
+    REGISTRY.scan_list_idx = 1
+    REGISTRY.scan_active = false
+    REGISTRY.scan_seen = nil
+    REGISTRY.ready_since = nil
+    REGISTRY.initial_scan_done = false
+    REGISTRY.next_id = 1
     REGISTRY.alias_by_class = build_alias_map()
     REGISTRY.by_tag.PIPE = nil
     REGISTRY.dirty = true
@@ -295,102 +487,87 @@ end
 
 function Registry.track(obj)
     if not is_valid(obj) or not is_world_actor(obj) then return false end
-    local full = ""
-    if obj.GetFullName then
-        local ok, res = pcall(obj.GetFullName, obj)
-        if ok then full = tostring(res or "") end
-    end
-    if full == "" then full = tostring(obj) end
-
-    local tag, code, short = classify_full(full)
-    if not tag then return false end
-    local key = object_key(obj)
-    if not key or key == "" then return false end
-
-    local reg = get_tag_registry(tag)
-    local entry = reg[key]
+    local entry, uid = _find_entry(obj)
     local changed = false
-    if not entry then
-        entry = { key = key }
-        reg[key] = entry
-        changed = true
-    end
-
-    local alias = nil
-    if REGISTRY.alias_by_class then
-        alias = REGISTRY.alias_by_class[short]
-    end
-    if not alias or alias == "" then
-        alias = sanitize_token(get_actor_name(obj))
-        if alias:find("/Game/", 1, true) or alias:find("PersistentLevel", 1, true) then
-            local last = alias:match("([^%.%/]+)$")
-            if last and last ~= "" then
-                alias = last
+    if entry then
+        if REGISTRY.by_obj[obj] ~= entry then
+            REGISTRY.by_obj[obj] = entry
+        end
+        if uid and REGISTRY.uid_by_obj[obj] ~= uid then
+            REGISTRY.uid_by_obj[obj] = uid
+        end
+        entry.last_seen = now_time()
+        local loc = get_actor_location(obj)
+        if update_location(entry, loc) then
+            changed = true
+        end
+        if changed then
+            REGISTRY.dirty = true
+        end
+        if REGISTRY.scan_active and REGISTRY.scan_seen then
+            if entry.key then
+                REGISTRY.scan_seen[entry.key] = true
             end
         end
+        return changed
     end
-    if entry.tag ~= tag then entry.tag = tag; changed = true end
-    if entry.code ~= code then entry.code = code; changed = true end
-    if entry.class ~= short then entry.class = short; changed = true end
-    if entry.full ~= full then entry.full = full; changed = true end
-    if entry.name ~= alias then entry.name = alias; changed = true end
-    entry.obj = obj
-    entry.last_seen = now_time()
-    entry.id = sanitize_id(key)
-    if entry.id ~= "" then
-        REGISTRY.by_id[entry.id] = entry
-    end
-
-    local loc = get_actor_location(obj)
-    if update_location(entry, loc) then
-        changed = true
-    end
-
-    if changed then
-        REGISTRY.dirty = true
-    end
-    return changed
+    _queue_pending(obj)
+    return false
 end
 
 function Registry.untrack(obj)
     if not obj then return false end
-    local key = object_key(obj)
-    if not key or key == "" then return false end
-    local changed = false
-    for tag, reg in pairs(REGISTRY.by_tag) do
-        local entry = reg[key]
-        if entry ~= nil then
-            reg[key] = nil
-            if entry.id and REGISTRY.by_id[entry.id] == entry then
-                REGISTRY.by_id[entry.id] = nil
-            end
-            changed = true
+    local entry = nil
+    local uid = _get_uid_cached(obj)
+    if uid and REGISTRY.by_uid[uid] then
+        entry = REGISTRY.by_uid[uid]
+    else
+        entry = REGISTRY.by_obj[obj]
+    end
+    if not entry then
+        REGISTRY.pending_set[obj] = nil
+        REGISTRY.name_queue_set[obj] = nil
+        return false
+    end
+    if entry.tag and REGISTRY.by_tag[entry.tag] and entry.key then
+        REGISTRY.by_tag[entry.tag][entry.key] = nil
+    end
+    for o, e in pairs(REGISTRY.by_obj) do
+        if e == entry then
+            REGISTRY.by_obj[o] = nil
+            REGISTRY.id_by_obj[o] = nil
+            REGISTRY.uid_by_obj[o] = nil
         end
     end
-    if changed then
-        REGISTRY.dirty = true
+    if entry.uid then
+        REGISTRY.by_uid[entry.uid] = nil
     end
-    return changed
+    if entry.id then
+        REGISTRY.by_id[entry.id] = nil
+    end
+    REGISTRY.pending_set[obj] = nil
+    REGISTRY.name_queue_set[obj] = nil
+    REGISTRY.dirty = true
+    return true
 end
 
 function Registry.refresh_positions()
     local changed = false
-    for _, reg in pairs(REGISTRY.by_tag) do
-        for key, entry in pairs(reg) do
-            local obj = entry.obj
-            if not is_valid(obj) or not is_world_actor(obj) then
-                reg[key] = nil
-                if entry.id and REGISTRY.by_id[entry.id] == entry then
-                    REGISTRY.by_id[entry.id] = nil
-                end
+    local to_remove = {}
+    for _, entry in pairs(REGISTRY.by_id) do
+        local obj = entry and entry.obj or nil
+        if not obj or not is_valid(obj) or not is_world_actor(obj) then
+            to_remove[#to_remove + 1] = obj
+        else
+            local loc = get_actor_location(obj)
+            if update_location(entry, loc) then
                 changed = true
-            else
-                local loc = get_actor_location(obj)
-                if update_location(entry, loc) then
-                    changed = true
-                end
             end
         end
+    end
+    for i = 1, #to_remove do
+        Registry.untrack(to_remove[i])
+        changed = true
     end
     if changed then
         REGISTRY.dirty = true
@@ -407,36 +584,183 @@ function Registry.prune(now)
     return Registry.refresh_positions()
 end
 
-function Registry.full_rescan()
-    local seen = {}
-    for _, rule in ipairs(REGISTRY.rules) do
-        local list = find_all(rule.short) or {}
-        for _, obj in ipairs(list) do
-            if is_valid(obj) and is_world_actor(obj) then
-                local key = object_key(obj)
-                if key then seen[key] = true end
-                Registry.track(obj)
-            end
-        end
+local function _start_scan(force)
+    REGISTRY.scan_jobs = {}
+    for i = 1, #REGISTRY.rules do
+        REGISTRY.scan_jobs[i] = REGISTRY.rules[i]
     end
-    for _, reg in pairs(REGISTRY.by_tag) do
-        for key, entry in pairs(reg) do
-            if not seen[key] then
-                reg[key] = nil
-                if entry and entry.id and REGISTRY.by_id[entry.id] == entry then
+    REGISTRY.scan_job_idx = 1
+    REGISTRY.scan_list = nil
+    REGISTRY.scan_list_idx = 1
+    REGISTRY.scan_current_rule = nil
+    REGISTRY.scan_seen = {}
+    REGISTRY.scan_active = true
+    REGISTRY.scan_started_at = now_time()
+    if force then
+        REGISTRY.initial_scan_done = false
+    end
+end
+
+local function _finish_scan()
+    local seen = REGISTRY.scan_seen or {}
+    local cutoff = REGISTRY.scan_started_at or 0
+    local to_remove = {}
+    for _, entry in pairs(REGISTRY.by_id) do
+        if entry and (not seen[entry.key]) and (entry.last_seen or 0) <= cutoff then
+            if entry.obj then
+                to_remove[#to_remove + 1] = entry.obj
+            else
+                if entry.tag and REGISTRY.by_tag[entry.tag] and entry.key then
+                    REGISTRY.by_tag[entry.tag][entry.key] = nil
+                end
+                if entry.uid then
+                    REGISTRY.by_uid[entry.uid] = nil
+                end
+                if entry.id then
                     REGISTRY.by_id[entry.id] = nil
                 end
-                REGISTRY.dirty = true
             end
         end
     end
+    for i = 1, #to_remove do
+        Registry.untrack(to_remove[i])
+    end
+    REGISTRY.scan_active = false
+    REGISTRY.scan_seen = nil
+    REGISTRY.scan_current_rule = nil
+    REGISTRY.scan_list = nil
+    REGISTRY.scan_list_idx = 1
+    REGISTRY.scan_job_idx = 1
+    REGISTRY.initial_scan_done = true
+end
+
+local function _process_scan(now)
+    if not REGISTRY.scan_active then return end
+    local processed = 0
+    while processed < SCAN_BATCH_MAX and REGISTRY.scan_active do
+        if not REGISTRY.scan_list then
+            local rule = REGISTRY.scan_jobs[REGISTRY.scan_job_idx]
+            if not rule then
+                _finish_scan()
+                break
+            end
+            REGISTRY.scan_current_rule = rule
+            REGISTRY.scan_list = find_all(rule.short) or {}
+            REGISTRY.scan_list_idx = 1
+        end
+
+        local rule = REGISTRY.scan_current_rule
+        while processed < SCAN_BATCH_MAX and REGISTRY.scan_list_idx <= #REGISTRY.scan_list do
+            local obj = REGISTRY.scan_list[REGISTRY.scan_list_idx]
+            REGISTRY.scan_list_idx = REGISTRY.scan_list_idx + 1
+            if is_valid(obj) and is_world_actor(obj) then
+                local _entry, changed = _add_or_update_entry(obj, rule.tag, rule.code, rule.short, now)
+                if changed then
+                    REGISTRY.dirty = true
+                end
+            end
+            processed = processed + 1
+        end
+
+        if REGISTRY.scan_list_idx > #REGISTRY.scan_list then
+            REGISTRY.scan_list = nil
+            REGISTRY.scan_current_rule = nil
+            REGISTRY.scan_job_idx = REGISTRY.scan_job_idx + 1
+        end
+    end
+end
+
+local function _process_pending(now)
+    if #REGISTRY.pending == 0 then return end
+    local processed = 0
+    local i = 1
+    while i <= #REGISTRY.pending and processed < TRACK_BATCH_MAX do
+        local item = REGISTRY.pending[i]
+        local obj = item and item.obj or nil
+        if not obj or not is_valid(obj) or not is_world_actor(obj) then
+            REGISTRY.pending_set[obj] = nil
+            table.remove(REGISTRY.pending, i)
+        elseif (now - (item.t or 0)) < CLASSIFY_DELAY then
+            i = i + 1
+        else
+            local tag, code, short = classify_obj(obj)
+            if tag then
+                REGISTRY.pending_set[obj] = nil
+                table.remove(REGISTRY.pending, i)
+                local _entry, changed = _add_or_update_entry(obj, tag, code, short, now)
+                if changed then
+                    REGISTRY.dirty = true
+                end
+                processed = processed + 1
+            else
+                item.attempts = (item.attempts or 0) + 1
+                item.t = now
+                if item.attempts >= MAX_CLASSIFY_ATTEMPTS then
+                    REGISTRY.pending_set[obj] = nil
+                    table.remove(REGISTRY.pending, i)
+                else
+                    i = i + 1
+                end
+            end
+        end
+    end
+end
+
+local function _process_name_queue(now)
+    if #REGISTRY.name_queue == 0 then return end
+    local processed = 0
+    local i = 1
+    while i <= #REGISTRY.name_queue and processed < NAME_BATCH_MAX do
+        local item = REGISTRY.name_queue[i]
+        local entry = item and item.entry or nil
+        local obj = entry and entry.obj or nil
+        if not entry or not obj or not is_valid(obj) then
+            if obj then REGISTRY.name_queue_set[obj] = nil end
+            table.remove(REGISTRY.name_queue, i)
+        elseif (now - (item.t or 0)) < NAME_DELAY then
+            i = i + 1
+        else
+            local name = get_actor_name(obj)
+            if name and name ~= "" and name ~= "Unknown" then
+                entry.name = sanitize_token(name)
+                entry.name_ready = true
+                REGISTRY.name_queue_set[obj] = nil
+                table.remove(REGISTRY.name_queue, i)
+                REGISTRY.dirty = true
+                processed = processed + 1
+            else
+                item.attempts = (item.attempts or 0) + 1
+                item.t = now
+                if item.attempts >= MAX_NAME_ATTEMPTS then
+                    REGISTRY.name_queue_set[obj] = nil
+                    table.remove(REGISTRY.name_queue, i)
+                else
+                    i = i + 1
+                end
+            end
+        end
+    end
+end
+
+local function _update_ready_state(now)
+    local pawn = (get_local_pawn and get_local_pawn()) or nil
+    if pawn and is_valid(pawn) then
+        if not REGISTRY.ready_since then
+            REGISTRY.ready_since = now
+        end
+    else
+        REGISTRY.ready_since = nil
+    end
+end
+
+function Registry.full_rescan()
+    _start_scan(true)
     return true
 end
 
 function Registry.initial_scan()
-    if REGISTRY.initial_scan_done then return end
-    REGISTRY.initial_scan_done = true
-    Registry.full_rescan()
+    if REGISTRY.initial_scan_done or REGISTRY.scan_active then return end
+    _start_scan(false)
 end
 
 local function tag_order()
@@ -489,8 +813,81 @@ end
 
 function Registry.get_entry_by_id(id)
     if not id or id == "" then return nil end
-    local norm = sanitize_id(id)
-    return REGISTRY.by_id[norm] or REGISTRY.by_id[id]
+    local key = tostring(id)
+    return REGISTRY.by_id[key] or REGISTRY.by_id[tonumber(id) or ""] or REGISTRY.by_id[id]
+end
+
+function Registry.get_counts()
+    local counts = {
+        total = 0,
+        monsters = 0,
+        keycards = 0,
+        disks = 0,
+        blackbox = 0,
+        weapons = 0,
+        money = 0,
+        puzzles = 0,
+        last_emit = REGISTRY.last_emit,
+        last_prune = REGISTRY.last_prune,
+        last_rescan = REGISTRY.last_rescan,
+    }
+    for tag, reg in pairs(REGISTRY.by_tag) do
+        local tag_up = tostring(tag or ""):upper()
+        local n = 0
+        for _ in pairs(reg or {}) do
+            n = n + 1
+        end
+        counts.total = counts.total + n
+        if tag_up == "MONSTER" then
+            counts.monsters = counts.monsters + n
+        elseif tag_up == "OBJECTIVE" or tag_up == "KEYCARD" then
+            counts.keycards = counts.keycards + n
+        elseif tag_up == "DATA" then
+            counts.disks = counts.disks + n
+        elseif tag_up == "BLACKBOX" then
+            counts.blackbox = counts.blackbox + n
+        elseif tag_up == "WEAPON" then
+            counts.weapons = counts.weapons + n
+        elseif tag_up == "MONEY" then
+            counts.money = counts.money + n
+        elseif tag_up == "PUZZLES" then
+            counts.puzzles = counts.puzzles + n
+        end
+    end
+    return counts
+end
+
+function Registry.clear()
+    for tag in pairs(REGISTRY.by_tag) do
+        REGISTRY.by_tag[tag] = {}
+    end
+    REGISTRY.by_obj = setmetatable({}, { __mode = "k" })
+    REGISTRY.by_uid = {}
+    REGISTRY.by_id = {}
+    REGISTRY.id_by_obj = setmetatable({}, { __mode = "k" })
+    REGISTRY.uid_by_obj = setmetatable({}, { __mode = "k" })
+    REGISTRY.pending = {}
+    REGISTRY.pending_set = setmetatable({}, { __mode = "k" })
+    REGISTRY.name_queue = {}
+    REGISTRY.name_queue_set = setmetatable({}, { __mode = "k" })
+    REGISTRY.scan_jobs = {}
+    REGISTRY.scan_job_idx = 1
+    REGISTRY.scan_list = nil
+    REGISTRY.scan_list_idx = 1
+    REGISTRY.scan_active = false
+    REGISTRY.scan_seen = nil
+    REGISTRY.scan_current_rule = nil
+    REGISTRY.ready_since = nil
+    REGISTRY.initial_scan_done = false
+    REGISTRY.next_id = 1
+    REGISTRY.dirty = true
+    return true
+end
+
+function Registry.rebuild()
+    Registry.clear()
+    Registry.full_rescan()
+    return true
 end
 
 local function entry_status(entry)
@@ -514,7 +911,7 @@ local function entry_status(entry)
 end
 
 local function get_player_location()
-    local pawn = (TP and TP.get_local_pawn and TP.get_local_pawn()) or nil
+    local pawn = (get_local_pawn and get_local_pawn()) or nil
     if pawn and is_valid(pawn) then
         return get_actor_location(pawn)
     end
@@ -594,11 +991,19 @@ end
 
 function Registry.tick(force_emit)
     local now = now_time()
-    Registry.initial_scan()
+    _update_ready_state(now)
+    if not REGISTRY.initial_scan_done and not REGISTRY.scan_active then
+        if REGISTRY.ready_since and (now - REGISTRY.ready_since) >= READY_SCAN_DELAY then
+            Registry.initial_scan()
+        end
+    end
+    _process_pending(now)
+    _process_scan(now)
+    _process_name_queue(now)
     if update_self_position() then
         REGISTRY.dirty = true
     end
-    if RESCAN_INTERVAL > 0 and (now - REGISTRY.last_rescan) > RESCAN_INTERVAL then
+    if RESCAN_INTERVAL > 0 and (now - REGISTRY.last_rescan) > RESCAN_INTERVAL and not REGISTRY.scan_active then
         REGISTRY.last_rescan = now
         Registry.full_rescan()
     end

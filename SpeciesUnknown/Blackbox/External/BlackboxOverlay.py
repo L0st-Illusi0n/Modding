@@ -1,7 +1,6 @@
-try:
-    import keyboard  # global hotkey (may require admin privileges)
-except Exception:
-    keyboard = None
+import os
+import ctypes
+from ctypes import wintypes
 from pathlib import Path
 
 import time
@@ -15,7 +14,31 @@ from PySide6.QtWidgets import (
     QPushButton, QCheckBox, QComboBox,
     QSlider, QMessageBox, QListWidget, QListWidgetItem,
 )
-from PySide6.QtCore import Qt, QFileSystemWatcher, Signal
+from PySide6.QtGui import (
+    QPainter, QPen, QBrush, QColor, QLinearGradient, QRadialGradient,
+    QFont, QFontMetrics, QPainterPath,
+)
+from PySide6.QtCore import Qt, QFileSystemWatcher, Signal, QTimer
+
+_MUTEX_HANDLE = None
+
+
+def _ensure_single_instance() -> bool:
+    if os.name != "nt":
+        return True
+    global _MUTEX_HANDLE
+    name = "Global\\BlackboxOverlayMutex"
+    try:
+        _MUTEX_HANDLE = ctypes.windll.kernel32.CreateMutexW(None, True, name)
+        if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            return False
+    except Exception:
+        return True
+    return True
+
+
+if not _ensure_single_instance():
+    raise SystemExit(0)
 
 
 def _base_dir() -> Path:
@@ -57,6 +80,403 @@ CMD_PATH = str(BASE_DIR / "bridge_cmd.txt")
 ACK_PATH = str(BASE_DIR / "bridge_ack.txt")
 NOTICE_PATH = str(BASE_DIR / "bridge_notice.txt")
 REGISTRY_PATH = str(BASE_DIR / "bridge_registry.txt")
+STATE_PATH = str(BASE_DIR / "bridge_state.txt")
+GAME_EXE = "SpeciesUnknown-Win64-Shipping.exe"
+GAME_WINDOW_TITLE = "SpeciesUnknown"
+# Prefer process checks (more reliable than window-title). Add more names if needed.
+GAME_PROCESS_NAMES = [
+    "SpeciesUnknown-Win64-Shipping.exe",
+    "SpeciesUnknown.exe",
+]
+
+# ===== Robust game-process detection =====
+_GAME_PID_CACHE = None
+_GAME_EXE_CACHE = None  # lowercase exe name
+_GAME_CACHE_TIME = 0.0
+_GAME_CACHE_TTL_S = 0.5
+PROCESS_CHECK_INTERVAL_MS = 1000
+
+CONTRACT_PROP_CONFIG = [
+    {
+        "name": "Valid_13_7EC50B9D43830CC60C6CFB89C4A56633",
+        "label": "Valid",
+        "kind": "bool",
+        "exclude": True,
+        "default": True,
+    },
+    {
+        "name": "ContractType_2_AD7B8E08435CF5A38556E7BA67C34760",
+        "label": "Contract Type",
+        "kind": "int",
+        "exclude": False,
+        "default": 0,
+    },
+    {
+        "name": "Difficulty_5_84E907A245C9C4C6CA73B4B492F85329",
+        "label": "Difficulty",
+        "kind": "int",
+        "exclude": False,
+        "default": 0,
+    },
+    {
+        "name": "Map_33_3AB0E6BD42FE920DECF2A89E52105CBF",
+        "label": "Map",
+        "kind": "int",
+        "exclude": False,
+        "default": 0,
+    },
+    {
+        "name": "Bonus_37_1897E8074DDDA168BDAA24BC50497746",
+        "label": "Bonus",
+        "kind": "int",
+        "exclude": False,
+        "default": 0,
+    },
+    {
+        "name": "RespawnTicket_8_A88C5BA64BADD031647C7BBAB7B1DCD3",
+        "label": "Respawn Tickets",
+        "kind": "int",
+        "exclude": False,
+        "default": 0,
+    },
+    {
+        "name": "PowerAtStart_11_C457EA0B40DD327B66E17FBA29A033CD",
+        "label": "Power At Start",
+        "kind": "bool",
+        "exclude": False,
+        "default": False,
+    },
+    {
+        "name": "PirateInfasion_16_0C40614A4525CF1F61426D8C1612CD02",
+        "label": "Pirate Infasion",
+        "kind": "bool",
+        "exclude": True,
+        "default": False,
+    },
+    {
+        "name": "ExplosiveItems_26_911C078943295906DC83AD9AE6E41C50",
+        "label": "Explosive Items",
+        "kind": "bool",
+        "exclude": False,
+        "default": False,
+    },
+    {
+        "name": "WeaponsCat1_18_791AA0694D75543C3E72E9BF6CBDDED7",
+        "label": "Weapons Cat 1",
+        "kind": "bool",
+        "exclude": False,
+        "default": False,
+    },
+    {
+        "name": "WeaponsCat2_20_3287E6454140FA9F9FAEA2BBE0683E3A",
+        "label": "Weapons Cat 2",
+        "kind": "bool",
+        "exclude": False,
+        "default": False,
+    },
+    {
+        "name": "WeaponBeep_30_A709702A49C40150494FC5A3BC396644",
+        "label": "Weapon Beep",
+        "kind": "bool",
+        "exclude": False,
+        "default": False,
+    },
+    {
+        "name": "PaidAmmoAndHealingPoint_28_DD503146439664BB746EE4BCD5F9EB11",
+        "label": "Paid Ammo + Healing",
+        "kind": "bool",
+        "exclude": False,
+        "default": False,
+    },
+    {
+        "name": "PowerInstable_43_08F6519448E0B007804A8E98E1C81DBB",
+        "label": "Unstable Power",
+        "kind": "bool",
+        "exclude": False,
+        "default": False,
+    },
+    {
+        "name": "Turret_44_40482A9D49BF678F60534D8484469ECC",
+        "label": "Turret",
+        "kind": "bool",
+        "exclude": True,
+        "default": False,
+    },
+    {
+        "name": "TimeLimit_23_33123F0347EBBAC12A84EF8683EDF14B",
+        "label": "Time Limit",
+        "kind": "int",
+        "exclude": True,
+        "default": 0,
+    },
+    {
+        "name": "MaxBounty_40_41D52ADA489C1A0CC271FC8E07865CA3",
+        "label": "Max Bounty",
+        "kind": "int",
+        "exclude": False,
+        "default": 1000,
+    },
+    {
+        "name": "TestModif_46_FC4300D547CDC9E3BD1A80B3F37854FB",
+        "label": "Test Modif",
+        "kind": "bool",
+        "exclude": True,
+        "default": False,
+    },
+]
+
+WEAPON_TYPES = [
+    ("RIFLE", "Rifle"),
+    ("SMG", "SMG"),
+    ("SHOTGUN", "Shotgun"),
+    ("FROST", "Frost Gun"),
+    ("LASER", "Laser Gun"),
+    ("LIGHTNING", "Lightning Gun"),
+    ("FLAME", "Flame Thrower"),
+]
+WEAPON_LABELS = {code: label for code, label in WEAPON_TYPES}
+
+_IS_WINDOWS = os.name == "nt"
+if _IS_WINDOWS:
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    try:
+        ULONG_PTR = wintypes.ULONG_PTR
+    except AttributeError:
+        ULONG_PTR = ctypes.c_void_p
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ULONG_PTR),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    _kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    _kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32))
+    _kernel32.Process32FirstW.restype = wintypes.BOOL
+    _kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32))
+    _kernel32.Process32NextW.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    _user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    _user32.IsWindowVisible.restype = wintypes.BOOL
+    _user32.IsZoomed.argtypes = (wintypes.HWND,)
+    _user32.IsZoomed.restype = wintypes.BOOL
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    _user32.EnumWindows.argtypes = (WNDENUMPROC, wintypes.LPARAM)
+    _user32.EnumWindows.restype = wintypes.BOOL
+    _user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    _user32.GetWindowTextW.restype = ctypes.c_int
+    _user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+    _user32.GetWindowTextLengthW.restype = ctypes.c_int
+
+
+def _get_pids_by_name(name: str) -> list[int]:
+    if not _IS_WINDOWS:
+        return []
+    name = str(name or "").lower()
+    if not name:
+        return []
+    snapshot = _kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot == INVALID_HANDLE_VALUE:
+        return []
+    pids = []
+    entry = PROCESSENTRY32()
+    entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+    if _kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+        while True:
+            exe = str(entry.szExeFile or "").lower()
+            if exe == name:
+                pids.append(int(entry.th32ProcessID))
+            if not _kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                break
+    _kernel32.CloseHandle(snapshot)
+    return pids
+
+
+def _query_process_image_name(pid: int) -> str | None:
+    """Return full path to process image for pid, or None."""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            buf_len = wintypes.DWORD(32768)
+            buf = ctypes.create_unicode_buffer(buf_len.value)
+            ok = kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(buf_len))
+            if not ok:
+                return None
+            return buf.value
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """True if pid exists and is still active."""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            STILL_ACTIVE = 259
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
+def _detect_game_process() -> tuple[int, str] | None:
+    """Detect the game process. Returns (pid, exe_lower) or None."""
+    global _GAME_PID_CACHE, _GAME_EXE_CACHE, _GAME_CACHE_TIME
+    now = time.time()
+    if _GAME_PID_CACHE and (now - _GAME_CACHE_TIME) < _GAME_CACHE_TTL_S:
+        if _pid_is_alive(_GAME_PID_CACHE):
+            return (_GAME_PID_CACHE, _GAME_EXE_CACHE or "")
+        _GAME_PID_CACHE = None
+        _GAME_EXE_CACHE = None
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        TH32CS_SNAPPROCESS = 0x00000002
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+        if snap and snap != INVALID_HANDLE_VALUE:
+            try:
+                entry = PROCESSENTRY32()
+                entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+                want_exact = {n.lower() for n in GAME_PROCESS_NAMES}
+                while ok:
+                    exe = (entry.szExeFile or "").lower()
+                    pid = int(entry.th32ProcessID)
+                    if exe in want_exact or exe.startswith("speciesunknown"):
+                        _GAME_PID_CACHE = pid
+                        _GAME_EXE_CACHE = exe
+                        _GAME_CACHE_TIME = now
+                        return (pid, exe)
+                    ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+            finally:
+                kernel32.CloseHandle(snap)
+    except Exception:
+        pass
+
+    _GAME_CACHE_TIME = now
+    return None
+
+
+def _get_pid_from_hwnd(hwnd) -> int | None:
+    if not _IS_WINDOWS or not hwnd:
+        return None
+    pid = wintypes.DWORD(0)
+    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return int(pid.value) if pid.value else None
+
+
+def _get_window_titles() -> list[tuple[int, str]]:
+    if not _IS_WINDOWS:
+        return []
+    results = []
+
+    @WNDENUMPROC
+    def _enum_cb(hwnd, lparam):
+        if not _user32.IsWindowVisible(hwnd):
+            return True
+        length = _user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        if _user32.GetWindowTextW(hwnd, buf, length + 1) > 0:
+            title = buf.value
+            if title:
+                results.append((int(hwnd), title))
+        return True
+
+    _user32.EnumWindows(_enum_cb, 0)
+    return results
+
+
+def _find_windows_by_title(title: str) -> list[tuple[int, str]]:
+    if not _IS_WINDOWS:
+        return []
+    needle = str(title or "").strip().lower()
+    if not needle:
+        return []
+    matches = []
+    for hwnd, window_title in _get_window_titles():
+        if needle in str(window_title).lower():
+            matches.append((hwnd, window_title))
+    return matches
+
+
+def _get_foreground_pid_zoomed():
+    if not _IS_WINDOWS:
+        return None, False, False
+    hwnd = _user32.GetForegroundWindow()
+    if not hwnd:
+        return None, False, False
+    pid = wintypes.DWORD(0)
+    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    visible = bool(_user32.IsWindowVisible(hwnd))
+    zoomed = bool(_user32.IsZoomed(hwnd))
+    return int(pid.value), visible, zoomed
+
+
+def _get_foreground_title_zoomed():
+    if not _IS_WINDOWS:
+        return "", False, False, None
+    hwnd = _user32.GetForegroundWindow()
+    if not hwnd:
+        return "", False, False, None
+    length = _user32.GetWindowTextLengthW(hwnd)
+    title = ""
+    if length > 0:
+        buf = ctypes.create_unicode_buffer(length + 1)
+        if _user32.GetWindowTextW(hwnd, buf, length + 1) > 0:
+            title = buf.value or ""
+    visible = bool(_user32.IsWindowVisible(hwnd))
+    zoomed = bool(_user32.IsZoomed(hwnd))
+    pid = _get_pid_from_hwnd(hwnd)
+    return title, visible, zoomed, pid
 
 
 class CommandBridge:
@@ -80,12 +500,160 @@ class CommandBridge:
         except Exception:
             return None
 
+
+class ToastWidget(QWidget):
+    closed = Signal(object)
+
+    def __init__(self, text: str, level: str = "INFO", duration_ms: int = 2500, base_font: QFont | None = None):
+        super().__init__()
+        self.text = str(text or "")
+        self.level = str(level or "INFO").upper()
+        self.duration_ms = max(800, int(duration_ms) if duration_ms is not None else 2500)
+
+        self.font = QFont(base_font) if base_font else QFont("Agency FB", 10, QFont.Bold)
+        self.font.setPointSize(max(10, self.font.pointSize()))
+        self.font.setLetterSpacing(QFont.PercentageSpacing, 105)
+
+        self.setWindowFlags(
+            Qt.WindowStaysOnTopHint
+            | Qt.FramelessWindowHint
+            | Qt.Tool
+            | Qt.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        fm = QFontMetrics(self.font)
+        w = max(300, fm.horizontalAdvance(self.text) + 60)
+        h = max(48, fm.height() + 24)
+        self.resize(w, h)
+
+        self._alpha = 0.0
+        self._phase = "fade_in"
+        self._t0 = time.time()
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    def _accent_color(self):
+        if self.level in ("OK", "SUCCESS", "GOOD"):
+            return QColor(90, 210, 140, 230)
+        if self.level in ("WARN", "WARNING"):
+            return QColor(240, 180, 80, 230)
+        if self.level in ("ERR", "ERROR", "ALERT", "FAIL"):
+            return QColor(240, 90, 90, 230)
+        return QColor(150, 110, 230, 230)
+
+    def _tick(self):
+        now = time.time()
+        dt = now - self._t0
+
+        fade_in_s = 0.14
+        fade_out_s = 0.18
+        hold_s = max(0.0, (self.duration_ms / 1000.0) - (fade_in_s + fade_out_s))
+
+        if self._phase == "fade_in":
+            self._alpha = min(1.0, dt / fade_in_s)
+            if dt >= fade_in_s:
+                self._phase = "hold"
+                self._t0 = now
+        elif self._phase == "hold":
+            self._alpha = 1.0
+            if dt >= hold_s:
+                self._phase = "fade_out"
+                self._t0 = now
+        else:
+            self._alpha = max(0.0, 1.0 - (dt / fade_out_s))
+            if dt >= fade_out_s:
+                self._timer.stop()
+                self.close()
+                self.closed.emit(self)
+                return
+
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        r = self.rect()
+        radius = 14
+        path = QPainterPath()
+        path.addRoundedRect(r.adjusted(2, 2, -2, -2), radius, radius)
+
+        accent = self._accent_color()
+
+        glow = QRadialGradient(r.center(), max(r.width(), r.height()) * 0.9)
+        glow.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), int(110 * self._alpha)))
+        glow.setColorAt(0.7, QColor(50, 24, 90, int(40 * self._alpha)))
+        glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.fillPath(path, glow)
+
+        bg_grad = QLinearGradient(r.topLeft(), r.bottomRight())
+        bg_grad.setColorAt(0.0, QColor(8, 6, 14, int(230 * self._alpha)))
+        bg_grad.setColorAt(1.0, QColor(26, 14, 40, int(230 * self._alpha)))
+        painter.fillPath(path, bg_grad)
+
+        painter.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), int(190 * self._alpha)), 2))
+        painter.drawPath(path)
+
+        inner = r.adjusted(6, 6, -6, -6)
+        painter.setPen(QPen(QColor(210, 170, 255, int(140 * self._alpha)), 1))
+        painter.drawRoundedRect(inner, radius - 4, radius - 4)
+
+        painter.setFont(self.font)
+        painter.setPen(QPen(QColor(235, 220, 255, int(255 * self._alpha)), 1))
+        painter.drawText(r.adjusted(18, 0, -18, 0), Qt.AlignVCenter | Qt.AlignLeft, self.text)
+
+
+class ToastManager:
+    def __init__(self):
+        self._toasts = []
+        self._base_font = QFont("Agency FB", 10, QFont.Bold)
+        self._base_font.setLetterSpacing(QFont.PercentageSpacing, 105)
+
+    def show(self, text: str, level: str = "INFO", duration_ms: int = 2500):
+        text = str(text or "").strip()
+        if not text:
+            return
+        toast = ToastWidget(text, level, duration_ms, self._base_font)
+        toast.closed.connect(self._on_toast_closed)
+        self._toasts.append(toast)
+        self._reposition()
+        toast.show()
+        toast.raise_()
+
+    def _on_toast_closed(self, toast):
+        if toast in self._toasts:
+            self._toasts.remove(toast)
+            self._reposition()
+
+    def _reposition(self):
+        try:
+            screen = QApplication.primaryScreen()
+            geo = screen.availableGeometry() if screen else None
+            if not geo:
+                return
+            spacing = 10
+            y = geo.y() + int(geo.height() * 0.12)
+            for toast in list(self._toasts):
+                w = toast.width()
+                x = geo.x() + max(0, (geo.width() - w) // 2)
+                toast.move(x, y)
+                y += toast.height() + spacing
+        except Exception:
+            pass
+
 class ActionPanel(QWidget):
     _invoke = Signal(object)
 
     def __init__(self, send_cmd_cb):
         super().__init__()
         self._send_cmd = send_cmd_cb
+        self._panel_request_cb = None
+        self._panel_requested = None
         self.setObjectName("actionPanel")
         self.setWindowTitle("Blackbox Console")
         self.setFixedSize(720, 900)
@@ -95,6 +663,11 @@ class ActionPanel(QWidget):
             | Qt.Tool
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+
+        self._toast_mgr = ToastManager()
+        self._toast_mgr_external = None
+        self._initial_splash_shown = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
@@ -134,22 +707,56 @@ class ActionPanel(QWidget):
         body_l.setContentsMargins(12, 12, 12, 12)
         body_l.setSpacing(10)
 
-        status = QFrame()
-        status.setObjectName("panelStatus")
-        status_l = QHBoxLayout(status)
-        status_l.setContentsMargins(8, 6, 8, 6)
-        status_l.setSpacing(8)
+        info_bar = QFrame()
+        info_bar.setObjectName("panelStatus")
+        info_l = QVBoxLayout(info_bar)
+        info_l.setContentsMargins(10, 8, 10, 8)
+        info_l.setSpacing(6)
 
-        self.link_lbl = QLabel("LINK: OK")
-        self.link_lbl.setObjectName("panelChip")
-        status_l.addWidget(self.link_lbl)
+        info_top = QHBoxLayout()
+        info_top.setSpacing(8)
 
-        self.input_lbl = QLabel("INPUT: ENABLED")
-        self.input_lbl.setObjectName("panelChip")
-        status_l.addWidget(self.input_lbl)
+        self.info_status_lbl = QLabel("STATUS: --")
+        self.info_status_lbl.setObjectName("panelChip")
+        info_top.addWidget(self.info_status_lbl)
 
-        status_l.addStretch(1)
-        body_l.addWidget(status)
+        self.info_radar_lbl = QLabel("RADAR: --")
+        self.info_radar_lbl.setObjectName("panelChip")
+        info_top.addWidget(self.info_radar_lbl)
+
+        self.info_pawn_lbl = QLabel("PAWN: --")
+        self.info_pawn_lbl.setObjectName("panelChip")
+        info_top.addWidget(self.info_pawn_lbl)
+
+        self.info_map_lbl = QLabel("MAP: --")
+        self.info_map_lbl.setObjectName("panelChip")
+        info_top.addWidget(self.info_map_lbl)
+
+        info_top.addStretch(1)
+        info_l.addLayout(info_top)
+
+        info_bottom = QHBoxLayout()
+        info_bottom.setSpacing(8)
+        self.info_world_lbl = QLabel("WORLD: --")
+        self.info_world_lbl.setObjectName("panelChip")
+        info_bottom.addWidget(self.info_world_lbl)
+
+        self.info_tracked_lbl = QLabel("TRACKED: --")
+        self.info_tracked_lbl.setObjectName("panelChip")
+        info_bottom.addWidget(self.info_tracked_lbl)
+
+        self.info_events_lbl = QLabel("EVENTS: --")
+        self.info_events_lbl.setObjectName("panelChip")
+        info_bottom.addWidget(self.info_events_lbl)
+
+        self.info_bridge_lbl = QLabel("BRIDGE: --")
+        self.info_bridge_lbl.setObjectName("panelChip")
+        info_bottom.addWidget(self.info_bridge_lbl)
+
+        info_bottom.addStretch(1)
+
+        info_l.addLayout(info_bottom)
+        body_l.addWidget(info_bar)
 
         tabs = QTabWidget()
         tabs.setObjectName("panelTabs")
@@ -172,8 +779,10 @@ class ActionPanel(QWidget):
 
         tp_layout = _make_tab("Teleport")
         player_layout = _make_tab("Player")
+        weapons_layout = _make_tab("Weapons")
         world_layout = _make_tab("World")
         puzzles_layout = _make_tab("Puzzles")
+        contracts_layout = _make_tab("Contracts")
         debug_layout = _make_tab("Debug")
 
         # ================== TELEPORT ==================
@@ -603,27 +1212,322 @@ class ActionPanel(QWidget):
         puzzles_layout.addWidget(air_box)
         puzzles_layout.addStretch(1)
 
+        # ================== CONTRACTS ==================
+        self._contract_props = list(CONTRACT_PROP_CONFIG)
+        self._contract_controls = {}
+        self._contract_defaults = {cfg["name"]: cfg.get("default") for cfg in self._contract_props}
+
+        contract_status_box = QFrame()
+        contract_status_box.setObjectName("groupBox")
+        contract_status_l = QVBoxLayout(contract_status_box)
+        contract_status_l.setContentsMargins(12, 10, 12, 10)
+        contract_status_l.setSpacing(8)
+
+        contract_status_hdr = QLabel("CONTRACT STATUS")
+        contract_status_hdr.setObjectName("groupHeader")
+        contract_status_l.addWidget(contract_status_hdr)
+
+        contract_row = QHBoxLayout()
+        self.contract_refresh_btn = QPushButton("Refresh Status")
+        self.contract_refresh_btn.setObjectName("panelButton")
+        contract_row.addWidget(self.contract_refresh_btn)
+
+        self.contract_status_lbl = QLabel("Status: --")
+        self.contract_status_lbl.setObjectName("panelChip")
+        contract_row.addWidget(self.contract_status_lbl)
+
+        self.contract_map_lbl = QLabel("Map: --")
+        self.contract_map_lbl.setObjectName("panelChip")
+        contract_row.addWidget(self.contract_map_lbl)
+
+        self.contract_lists_lbl = QLabel("Lists: --")
+        self.contract_lists_lbl.setObjectName("panelChip")
+        contract_row.addWidget(self.contract_lists_lbl)
+        contract_row.addStretch(1)
+        contract_status_l.addLayout(contract_row)
+
+        contract_row2 = QHBoxLayout()
+        self.contract_open_btn = QPushButton("Open Contracts")
+        self.contract_open_btn.setObjectName("panelButtonPrimary")
+        contract_row2.addWidget(self.contract_open_btn)
+
+        self.contract_start_btn = QPushButton("Start Contract")
+        self.contract_start_btn.setObjectName("panelButton")
+        contract_row2.addWidget(self.contract_start_btn)
+
+        self.contract_hooks_lbl = QLabel("Hooks: --")
+        self.contract_hooks_lbl.setObjectName("panelChip")
+        contract_row2.addWidget(self.contract_hooks_lbl)
+
+        self.contract_age_lbl = QLabel("Hook Age: --")
+        self.contract_age_lbl.setObjectName("panelChip")
+        contract_row2.addWidget(self.contract_age_lbl)
+
+        self.contract_props_lbl = QLabel("Props: --")
+        self.contract_props_lbl.setObjectName("panelChip")
+        contract_row2.addWidget(self.contract_props_lbl)
+        contract_row2.addStretch(1)
+        contract_status_l.addLayout(contract_row2)
+
+        contract_hint = QLabel("Open the contract terminal in Lobby to register lists.")
+        contract_hint.setObjectName("panelHint")
+        contract_hint.setWordWrap(True)
+        contract_status_l.addWidget(contract_hint)
+
+        contracts_layout.addWidget(contract_status_box)
+
+        contract_set_box = QFrame()
+        contract_set_box.setObjectName("groupBox")
+        contract_set_l = QVBoxLayout(contract_set_box)
+        contract_set_l.setContentsMargins(12, 10, 12, 10)
+        contract_set_l.setSpacing(8)
+
+        contract_set_hdr = QLabel("SET CONTRACT")
+        contract_set_hdr.setObjectName("groupHeader")
+        contract_set_l.addWidget(contract_set_hdr)
+
+        excluded_defaults = []
+        for cfg in self._contract_props:
+            if not cfg.get("exclude"):
+                continue
+            val = cfg.get("default")
+            if isinstance(val, bool):
+                val = "true" if val else "false"
+            excluded_defaults.append(f"{cfg.get('label')}={val}")
+        defaults_hint = "Excluded defaults: " + ", ".join(excluded_defaults)
+        contract_defaults_lbl = QLabel(defaults_hint)
+        contract_defaults_lbl.setObjectName("panelHint")
+        contract_defaults_lbl.setWordWrap(True)
+        contract_set_l.addWidget(contract_defaults_lbl)
+
+        values_hdr = QLabel("VALUES")
+        values_hdr.setObjectName("panelSubTitle")
+        contract_set_l.addWidget(values_hdr)
+
+        contract_dropdowns = {
+            "ContractType_2_AD7B8E08435CF5A38556E7BA67C34760": [
+                ("Elimination", 0),
+                ("Self Destruct", 1),
+                ("Capture", 2),
+                ("Extraction", 3),
+            ],
+            "Difficulty_5_84E907A245C9C4C6CA73B4B492F85329": [
+                ("Discovery", 0),
+                ("Easy", 1),
+                ("Normal", 2),
+                ("Hard", 3),
+                ("Nightmare", 4),
+            ],
+            "Map_33_3AB0E6BD42FE920DECF2A89E52105CBF": [
+                ("Hawking", 0),
+            ],
+        }
+
+        for cfg in self._contract_props:
+            if cfg.get("exclude") or cfg.get("kind") != "int":
+                continue
+            row = QHBoxLayout()
+            lbl = QLabel(cfg.get("label") or cfg.get("name") or "Value")
+            lbl.setObjectName("panelSubTitle")
+            row.addWidget(lbl, 1)
+
+            dropdown = contract_dropdowns.get(cfg.get("name"))
+            if dropdown:
+                edit = QComboBox()
+                edit.setObjectName("panelCombo")
+                for text, val in dropdown:
+                    edit.addItem(text, val)
+                edit.setCurrentIndex(max(0, edit.findData(cfg.get("default", 0))))
+            else:
+                edit = QLineEdit()
+                edit.setObjectName("panelInput")
+                edit.setText(str(cfg.get("default", 0)))
+            row.addWidget(edit, 0)
+
+            status = QLabel(str(cfg.get("default", 0)))
+            status.setObjectName("panelChip")
+            row.addWidget(status, 0)
+
+            contract_set_l.addLayout(row)
+            self._contract_controls[cfg["name"]] = {
+                "kind": "int",
+                "label": cfg.get("label") or cfg.get("name"),
+                "widget": edit,
+                "status": status,
+                "dropdown": bool(dropdown),
+            }
+
+        flags_hdr = QLabel("FLAGS")
+        flags_hdr.setObjectName("panelSubTitle")
+        contract_set_l.addWidget(flags_hdr)
+
+        for cfg in self._contract_props:
+            if cfg.get("exclude") or cfg.get("kind") != "bool":
+                continue
+            row = QHBoxLayout()
+            cb = QCheckBox(cfg.get("label") or cfg.get("name") or "Flag")
+            cb.setObjectName("panelCheck")
+            cb.setChecked(bool(cfg.get("default", False)))
+            row.addWidget(cb, 0)
+
+            status = QLabel("ON" if cb.isChecked() else "OFF")
+            status.setObjectName("panelChip")
+            row.addWidget(status, 0)
+            row.addStretch(1)
+            contract_set_l.addLayout(row)
+
+            self._contract_controls[cfg["name"]] = {
+                "kind": "bool",
+                "label": cfg.get("label") or cfg.get("name"),
+                "widget": cb,
+                "status": status,
+            }
+
+        contract_apply_row = QHBoxLayout()
+        self.contract_apply_btn = QPushButton("Apply Contract")
+        self.contract_apply_btn.setObjectName("panelButtonPrimary")
+        contract_apply_row.addWidget(self.contract_apply_btn)
+        contract_apply_row.addStretch(1)
+        contract_set_l.addLayout(contract_apply_row)
+
+        contracts_layout.addWidget(contract_set_box)
+        contracts_layout.addStretch(1)
+
         # ================== DEBUG ==================
-        debug_box = QFrame()
-        debug_box.setObjectName("groupBox")
-        debug_l = QVBoxLayout(debug_box)
-        debug_l.setContentsMargins(12, 10, 12, 10)
-        debug_l.setSpacing(8)
+        debug_actions = QFrame()
+        debug_actions.setObjectName("groupBox")
+        debug_actions_l = QVBoxLayout(debug_actions)
+        debug_actions_l.setContentsMargins(12, 10, 12, 10)
+        debug_actions_l.setSpacing(8)
 
-        debug_hdr = QLabel("DEBUG")
+        debug_hdr = QLabel("DEBUG ACTIONS")
         debug_hdr.setObjectName("groupHeader")
-        debug_l.addWidget(debug_hdr)
+        debug_actions_l.addWidget(debug_hdr)
 
-        self.hook_prints_cb = QCheckBox("Hook Prints")
-        self.hook_prints_cb.setObjectName("panelCheck")
-        debug_l.addWidget(self.hook_prints_cb)
+        debug_btn_row = QHBoxLayout()
+        self.debug_refresh_btn = QPushButton("Force Refresh")
+        self.debug_refresh_btn.setObjectName("panelButtonPrimary")
+        debug_btn_row.addWidget(self.debug_refresh_btn)
 
-        debug_hint = QLabel("Prints a log line when any hook fires.")
-        debug_hint.setObjectName("panelHint")
-        debug_hint.setWordWrap(True)
-        debug_l.addWidget(debug_hint)
+        self.debug_resync_btn = QPushButton("Force Full Resync")
+        self.debug_resync_btn.setObjectName("panelButton")
+        debug_btn_row.addWidget(self.debug_resync_btn)
 
-        debug_layout.addWidget(debug_box)
+        self.debug_clear_btn = QPushButton("Clear Registry")
+        self.debug_clear_btn.setObjectName("panelButton")
+        debug_btn_row.addWidget(self.debug_clear_btn)
+
+        self.debug_rebuild_btn = QPushButton("Rebuild Registry")
+        self.debug_rebuild_btn.setObjectName("panelButton")
+        debug_btn_row.addWidget(self.debug_rebuild_btn)
+        debug_actions_l.addLayout(debug_btn_row)
+
+        debug_toggle_row = QHBoxLayout()
+        self.verbose_cb = QCheckBox("Verbose Logging")
+        self.verbose_cb.setObjectName("panelCheck")
+        debug_toggle_row.addWidget(self.verbose_cb)
+        debug_toggle_row.addStretch(1)
+        debug_actions_l.addLayout(debug_toggle_row)
+
+        debug_layout.addWidget(debug_actions)
+
+        core_box = QFrame()
+        core_box.setObjectName("groupBox")
+        core_l = QVBoxLayout(core_box)
+        core_l.setContentsMargins(12, 10, 12, 10)
+        core_l.setSpacing(6)
+
+        core_hdr = QLabel("CORE STATE")
+        core_hdr.setObjectName("groupHeader")
+        core_l.addWidget(core_hdr)
+
+        self.debug_map_lbl = QLabel("Map: --")
+        self.debug_map_lbl.setObjectName("panelChip")
+        core_l.addWidget(self.debug_map_lbl)
+
+        self.debug_world_lbl = QLabel("World Ready: --")
+        self.debug_world_lbl.setObjectName("panelChip")
+        core_l.addWidget(self.debug_world_lbl)
+
+        self.debug_pawn_lbl = QLabel("Pawn: --")
+        self.debug_pawn_lbl.setObjectName("panelChip")
+        core_l.addWidget(self.debug_pawn_lbl)
+
+        self.debug_pos_lbl = QLabel("Local Pos: --")
+        self.debug_pos_lbl.setObjectName("panelChip")
+        core_l.addWidget(self.debug_pos_lbl)
+
+        self.debug_radar_lbl = QLabel("Radar: --")
+        self.debug_radar_lbl.setObjectName("panelChip")
+        core_l.addWidget(self.debug_radar_lbl)
+
+        self.debug_proto_lbl = QLabel("Protocol: --")
+        self.debug_proto_lbl.setObjectName("panelChip")
+        core_l.addWidget(self.debug_proto_lbl)
+
+        debug_layout.addWidget(core_box)
+
+        reg_box = QFrame()
+        reg_box.setObjectName("groupBox")
+        reg_l = QVBoxLayout(reg_box)
+        reg_l.setContentsMargins(12, 10, 12, 10)
+        reg_l.setSpacing(6)
+
+        reg_hdr = QLabel("REGISTRY")
+        reg_hdr.setObjectName("groupHeader")
+        reg_l.addWidget(reg_hdr)
+
+        self.debug_reg_total_lbl = QLabel("Total Tracked: --")
+        self.debug_reg_total_lbl.setObjectName("panelChip")
+        reg_l.addWidget(self.debug_reg_total_lbl)
+
+        self.debug_reg_counts_lbl = QLabel("Monsters: -- | Keycards: -- | Disks: -- | Blackbox: -- | Weapons: -- | Money: --")
+        self.debug_reg_counts_lbl.setObjectName("panelChip")
+        self.debug_reg_counts_lbl.setWordWrap(True)
+        reg_l.addWidget(self.debug_reg_counts_lbl)
+
+        self.debug_reg_update_lbl = QLabel("Last Registry Update: --")
+        self.debug_reg_update_lbl.setObjectName("panelChip")
+        reg_l.addWidget(self.debug_reg_update_lbl)
+
+        self.debug_reg_prune_lbl = QLabel("Last Prune: --")
+        self.debug_reg_prune_lbl.setObjectName("panelChip")
+        reg_l.addWidget(self.debug_reg_prune_lbl)
+
+        debug_layout.addWidget(reg_box)
+
+        self.debug_adv_box = QFrame()
+        self.debug_adv_box.setObjectName("groupBox")
+        adv_l = QVBoxLayout(self.debug_adv_box)
+        adv_l.setContentsMargins(12, 10, 12, 10)
+        adv_l.setSpacing(8)
+
+        adv_hdr = QLabel("ADVANCED")
+        adv_hdr.setObjectName("groupHeader")
+        adv_l.addWidget(adv_hdr)
+
+        self.debug_bridge_lbl = QLabel("Bridge: --")
+        self.debug_bridge_lbl.setObjectName("panelChip")
+        adv_l.addWidget(self.debug_bridge_lbl)
+
+        self.debug_state_write_lbl = QLabel("State Write: --")
+        self.debug_state_write_lbl.setObjectName("panelChip")
+        adv_l.addWidget(self.debug_state_write_lbl)
+
+        self.debug_state_read_lbl = QLabel("State Read: --")
+        self.debug_state_read_lbl.setObjectName("panelChip")
+        adv_l.addWidget(self.debug_state_read_lbl)
+
+        self.debug_cmd_lbl = QLabel("Last Cmd/Ack: --")
+        self.debug_cmd_lbl.setObjectName("panelChip")
+        adv_l.addWidget(self.debug_cmd_lbl)
+
+        self.debug_perf_lbl = QLabel("Perf: --")
+        self.debug_perf_lbl.setObjectName("panelChip")
+        adv_l.addWidget(self.debug_perf_lbl)
+
+        self.debug_adv_box.setVisible(True)
+        debug_layout.addWidget(self.debug_adv_box)
         debug_layout.addStretch(1)
 
         # ================== PLAYER TARGET ==================
@@ -800,6 +1704,145 @@ class ActionPanel(QWidget):
         player_layout.addWidget(mv_box)
         player_layout.addStretch(1)
 
+        # ================== WEAPONS ==================
+        weapon_target_box = QFrame()
+        weapon_target_box.setObjectName("groupBox")
+        weapon_target_l = QVBoxLayout(weapon_target_box)
+        weapon_target_l.setContentsMargins(12, 10, 12, 10)
+        weapon_target_l.setSpacing(8)
+
+        weapon_target_hdr = QLabel("WEAPON TARGET")
+        weapon_target_hdr.setObjectName("groupHeader")
+        weapon_target_l.addWidget(weapon_target_hdr)
+
+        weapon_target_row = QHBoxLayout()
+        self.weapon_target_combo = QComboBox()
+        self.weapon_target_combo.setObjectName("panelCombo")
+        self.weapon_target_combo.addItem("No Players Found", "SELF")
+        self.weapon_target_combo.setEnabled(False)
+        weapon_target_row.addWidget(self.weapon_target_combo, 1)
+
+        self.weapon_refresh_players_btn = QPushButton("Refresh Players")
+        self.weapon_refresh_players_btn.setObjectName("panelButton")
+        weapon_target_row.addWidget(self.weapon_refresh_players_btn)
+        weapon_target_l.addLayout(weapon_target_row)
+
+        weapon_target_hint = QLabel("Weapons apply to the selected player (default: Self).")
+        weapon_target_hint.setObjectName("panelHint")
+        weapon_target_hint.setWordWrap(True)
+        weapon_target_l.addWidget(weapon_target_hint)
+
+        weapons_layout.addWidget(weapon_target_box)
+
+        weapon_focus_box = QFrame()
+        weapon_focus_box.setObjectName("groupBox")
+        weapon_focus_l = QVBoxLayout(weapon_focus_box)
+        weapon_focus_l.setContentsMargins(12, 10, 12, 10)
+        weapon_focus_l.setSpacing(8)
+
+        weapon_focus_hdr = QLabel("FOCUSED WEAPON")
+        weapon_focus_hdr.setObjectName("groupHeader")
+        weapon_focus_l.addWidget(weapon_focus_hdr)
+
+        self.weapon_focus_lbl = QLabel("Focused: -- | Target: --")
+        self.weapon_focus_lbl.setObjectName("panelChip")
+        self.weapon_focus_lbl.setWordWrap(True)
+        weapon_focus_l.addWidget(self.weapon_focus_lbl)
+
+        weapon_focus_hint = QLabel("Auto-updates from the selected player's current weapon.")
+        weapon_focus_hint.setObjectName("panelHint")
+        weapon_focus_hint.setWordWrap(True)
+        weapon_focus_l.addWidget(weapon_focus_hint)
+
+        weapons_layout.addWidget(weapon_focus_box)
+
+        weapon_cmd_box = QFrame()
+        weapon_cmd_box.setObjectName("groupBox")
+        weapon_cmd_l = QVBoxLayout(weapon_cmd_box)
+        weapon_cmd_l.setContentsMargins(12, 10, 12, 10)
+        weapon_cmd_l.setSpacing(8)
+
+        weapon_cmd_hdr = QLabel("WEAPON COMMANDS")
+        weapon_cmd_hdr.setObjectName("groupHeader")
+        weapon_cmd_l.addWidget(weapon_cmd_hdr)
+
+        dmg_row = QHBoxLayout()
+        dmg_label = QLabel("Damage")
+        dmg_label.setObjectName("panelSubTitle")
+        dmg_row.addWidget(dmg_label, 0)
+
+        self.weapon_dmg_input = QLineEdit("100")
+        self.weapon_dmg_input.setObjectName("panelInput")
+        self.weapon_dmg_input.setFixedWidth(80)
+        dmg_row.addWidget(self.weapon_dmg_input, 0)
+        dmg_row.addStretch(1)
+
+        self.weapon_dmg_apply_btn = QPushButton("Apply")
+        self.weapon_dmg_apply_btn.setObjectName("panelButtonPrimary")
+        dmg_row.addWidget(self.weapon_dmg_apply_btn, 0)
+        weapon_cmd_l.addLayout(dmg_row)
+
+        self.weapon_unlimited_cb = QCheckBox("Unlimited Ammo")
+        self.weapon_unlimited_cb.setObjectName("panelCheck")
+        weapon_cmd_l.addWidget(self.weapon_unlimited_cb)
+
+        max_row = QHBoxLayout()
+        self.weapon_maxammo_btn = QPushButton("Max Ammo")
+        self.weapon_maxammo_btn.setObjectName("panelButton")
+        max_row.addWidget(self.weapon_maxammo_btn)
+        max_row.addStretch(1)
+        weapon_cmd_l.addLayout(max_row)
+
+        weapons_layout.addWidget(weapon_cmd_box)
+
+        weapon_types_box = QFrame()
+        weapon_types_box.setObjectName("groupBox")
+        weapon_types_l = QVBoxLayout(weapon_types_box)
+        weapon_types_l.setContentsMargins(12, 10, 12, 10)
+        weapon_types_l.setSpacing(8)
+
+        weapon_types_hdr = QLabel("WEAPON TYPES")
+        weapon_types_hdr.setObjectName("groupHeader")
+        weapon_types_l.addWidget(weapon_types_hdr)
+
+        self.weapon_rows = []
+        for code, label in WEAPON_TYPES:
+            row = QHBoxLayout()
+            name_lbl = QLabel(label)
+            name_lbl.setObjectName("panelSubTitle")
+            row.addWidget(name_lbl, 1)
+
+            dist_lbl = QLabel("Nearest: --")
+            dist_lbl.setObjectName("panelChip")
+            row.addWidget(dist_lbl, 0)
+
+            goto_btn = QPushButton("Go To")
+            goto_btn.setObjectName("panelButtonPrimary")
+            goto_btn.setEnabled(False)
+            row.addWidget(goto_btn, 0)
+
+            bring_btn = QPushButton("Bring")
+            bring_btn.setObjectName("panelButton")
+            bring_btn.setEnabled(False)
+            row.addWidget(bring_btn, 0)
+
+            weapon_types_l.addLayout(row)
+            self.weapon_rows.append({
+                "code": code,
+                "label": label,
+                "dist": dist_lbl,
+                "goto": goto_btn,
+                "bring": bring_btn,
+            })
+
+        weapon_types_hint = QLabel("Distances update from the world registry.")
+        weapon_types_hint.setObjectName("panelHint")
+        weapon_types_hint.setWordWrap(True)
+        weapon_types_l.addWidget(weapon_types_hint)
+
+        weapons_layout.addWidget(weapon_types_box)
+        weapons_layout.addStretch(1)
+
         # Wire events
         self.refresh_players_btn.clicked.connect(self._refresh_players)
         self.target_combo.currentIndexChanged.connect(self._update_target_actions)
@@ -818,6 +1861,19 @@ class ActionPanel(QWidget):
         self.walkspeed_slider.valueChanged.connect(self._on_walkspeed_slider)
         self.walkspeed_apply_btn.clicked.connect(self._set_walkspeed)
         self.walkspeed_default_btn.clicked.connect(self._set_default_walkspeed)
+
+        self.weapon_refresh_players_btn.clicked.connect(self._refresh_players)
+        self.weapon_target_combo.currentIndexChanged.connect(self._on_weapon_target_changed)
+        self.weapon_dmg_apply_btn.clicked.connect(self._set_weapon_damage)
+        self.weapon_unlimited_cb.stateChanged.connect(self._toggle_unlimited_ammo)
+        self.weapon_maxammo_btn.clicked.connect(self._max_ammo)
+        for row in self.weapon_rows:
+            row["goto"].clicked.connect(
+                lambda _=False, c=row["code"]: self._weapon_goto(c)
+            )
+            row["bring"].clicked.connect(
+                lambda _=False, c=row["code"]: self._weapon_bring(c)
+            )
 
         self.world_refresh_btn.clicked.connect(self._refresh_world)
         self.world_filter_combo.currentIndexChanged.connect(self._refresh_world_list)
@@ -864,7 +1920,28 @@ class ActionPanel(QWidget):
                 lambda _=False, i=row["idx"]: self._airlock_set(i, False)
             )
 
-        self.hook_prints_cb.stateChanged.connect(self._toggle_hook_prints)
+        self.contract_refresh_btn.clicked.connect(self._refresh_contract_state)
+        self.contract_open_btn.clicked.connect(self._open_contracts)
+        self.contract_start_btn.clicked.connect(self._start_contract)
+        self.contract_apply_btn.clicked.connect(self._apply_contract)
+        for name, row in self._contract_controls.items():
+            if row.get("kind") == "bool":
+                row["widget"].stateChanged.connect(lambda _=False, n=name: self._on_contract_toggle(n))
+            else:
+                if row.get("dropdown"):
+                    row["widget"].currentIndexChanged.connect(
+                        lambda _=False, n=name: self._on_contract_value_changed(n)
+                    )
+                else:
+                    row["widget"].textChanged.connect(
+                        lambda _=False, n=name: self._on_contract_value_changed(n)
+                    )
+
+        self.verbose_cb.stateChanged.connect(self._toggle_hook_prints)
+        self.debug_refresh_btn.clicked.connect(self._debug_force_refresh)
+        self.debug_resync_btn.clicked.connect(self._debug_force_resync)
+        self.debug_clear_btn.clicked.connect(self._debug_clear_registry)
+        self.debug_rebuild_btn.clicked.connect(self._debug_rebuild_registry)
 
         self._invoke.connect(self._run_invoked)
 
@@ -872,6 +1949,7 @@ class ActionPanel(QWidget):
         self._ack_path = ACK_PATH
         self._ack_handlers = {}
         self._ack_watcher = QFileSystemWatcher(self)
+        self._last_ack_time = 0.0
         try:
             if self._ack_path:
                 if not Path(self._ack_path).exists():
@@ -897,15 +1975,33 @@ class ActionPanel(QWidget):
             "air_found": False,
             "air_entries": [],
         }
+        self._contract_state = {
+            "ready": False,
+            "map": "Unknown",
+            "lists": 0,
+            "first": False,
+            "props": 0,
+            "hooks": 0,
+            "age": None,
+            "types": {},
+            "values": {},
+        }
         self._world_entries = []
         self._world_self_pos = None
+        self._last_cmd_sent = ""
+        self._last_cmd_time = 0.0
         self._player_names = []
         self._self_name = None
         self._refresh_queue = []
+        self._state_data = {}
+        self._weapon_state = {}
+        self._last_weapon_state_request = 0.0
 
         self._update_target_actions()
         self._update_tp_actions()
         self._update_puzzle_actions()
+        self._sync_contract_controls_from_state()
+        self._update_contract_actions()
 
         # Notice watcher (event-based updates from UE4SS)
         self._notice_path = NOTICE_PATH
@@ -924,6 +2020,7 @@ class ActionPanel(QWidget):
         self._registry_path = REGISTRY_PATH
         self._registry_watcher = QFileSystemWatcher(self)
         self._last_registry_line = ""
+        self._last_registry_update = 0.0
         try:
             if self._registry_path:
                 if not Path(self._registry_path).exists():
@@ -933,10 +2030,31 @@ class ActionPanel(QWidget):
             pass
         self._registry_watcher.fileChanged.connect(self._on_registry_changed)
 
+        # State polling (info/debug bar)
+        self._state_path = STATE_PATH
+        self._last_state_line = ""
+        self._last_state_read = 0.0
+        self._last_state_write = 0.0
+        try:
+            if self._state_path and not Path(self._state_path).exists():
+                Path(self._state_path).write_text("", encoding="utf-8")
+        except Exception:
+            pass
+        self._state_timer = QTimer(self)
+        self._state_timer.setInterval(250)
+        self._state_timer.timeout.connect(self._poll_state)
+        self._state_timer.start()
+
+        self._weapon_state_timer = QTimer(self)
+        self._weapon_state_timer.setInterval(600)
+        self._weapon_state_timer.timeout.connect(self._tick_weapon_state)
+        self._weapon_state_timer.start()
+
         # Initial sync
         self._schedule(0.15, self._refresh_players)
         self._schedule(0.20, self._refresh_tp_state)
         self._schedule(0.25, self._refresh_puzzles)
+        self._schedule(0.30, self._refresh_contract_state)
 
         self.setStyleSheet("""
             QWidget {
@@ -1072,6 +2190,11 @@ class ActionPanel(QWidget):
             QLineEdit#panelInput:focus {
                 border: 1px solid rgba(180, 140, 255, 210);
             }
+            QLineEdit#panelInput:disabled {
+                color: rgba(140, 130, 160, 160);
+                background: rgba(20, 18, 24, 140);
+                border: 1px solid rgba(60, 60, 80, 120);
+            }
             QCheckBox#panelCheck {
                 spacing: 6px;
             }
@@ -1085,6 +2208,9 @@ class ActionPanel(QWidget):
             QCheckBox#panelCheck::indicator:checked {
                 background: rgba(160, 120, 240, 230);
                 border: 1px solid rgba(200, 160, 255, 220);
+            }
+            QCheckBox#panelCheck:disabled {
+                color: rgba(140, 130, 160, 160);
             }
             QPushButton#panelButtonPrimary {
                 background: rgba(120, 90, 210, 220);
@@ -1154,15 +2280,47 @@ class ActionPanel(QWidget):
         if self._send_cmd is None:
             return None
         try:
+            self._last_cmd_sent = f"{name} {arg}".strip()
+            self._last_cmd_time = time.monotonic()
             return self._send_cmd(name, arg)
         except Exception:
             return None
 
+    def show_toast(self, text: str, level: str = "INFO", duration_ms: int = 2500):
+        try:
+            mgr = self._toast_mgr_external or self._toast_mgr
+            mgr.show(text, level, duration_ms)
+        except Exception:
+            pass
+
+    def set_toast_manager(self, mgr):
+        if mgr is not None:
+            self._toast_mgr_external = mgr
+
     def showEvent(self, event):
         super().showEvent(event)
+        if not self._initial_splash_shown:
+            self._initial_splash_shown = True
+            self.show_toast("Blackbox Loaded!", "OK", 2400)
         self._schedule(0.05, self._refresh_players)
         self._schedule(0.08, self._refresh_tp_state)
         self._schedule(0.11, self._refresh_puzzles)
+        self._schedule(0.14, self._refresh_contract_state)
+        self._schedule(0.17, self._refresh_weapon_state)
+
+    def set_panel_request_cb(self, cb):
+        self._panel_request_cb = cb
+
+    def _emit_panel_request(self, open_value: bool):
+        want = open_value and True or False
+        if self._panel_requested == want:
+            return
+        self._panel_requested = want
+        if self._panel_request_cb:
+            try:
+                self._panel_request_cb(want)
+            except Exception:
+                pass
 
     def _target_text(self) -> str:
         if self.target_combo is None:
@@ -1192,6 +2350,101 @@ class ActionPanel(QWidget):
         self.goto_player_btn.setEnabled(not disable)
         self.bring_player_btn.setEnabled(not disable)
 
+    def _weapon_target_name(self) -> str:
+        if not self.weapon_target_combo or not self.weapon_target_combo.isEnabled():
+            return "self"
+        data = self.weapon_target_combo.currentData()
+        if data is None or str(data).strip() == "":
+            return "self"
+        if str(data).strip().upper() == "SELF":
+            return "self"
+        return str(data).strip()
+
+    def _weapon_target_display(self, target: str | None = None) -> str:
+        target = str(target or "").strip()
+        if not target:
+            target = self._weapon_target_name()
+        if target.lower() == "self":
+            if self._self_name:
+                return f"{self._self_name} (Self)"
+            return "Self"
+        if self._self_name and target.lower() == str(self._self_name).strip().lower():
+            return f"{self._self_name} (Self)"
+        return target
+
+    def _weapon_arg_with_target(self, arg: str) -> str:
+        target = self._weapon_target_name()
+        if target and target.lower() != "self":
+            if arg:
+                return f"{arg} {target}"
+            return target
+        return arg
+
+    def _set_weapon_focus_label(
+        self,
+        name: str | None,
+        code: str | None,
+        target: str | None,
+        ok: bool | None,
+        cls: str | None = None,
+    ):
+        if not self.weapon_focus_lbl:
+            return
+        target_label = self._weapon_target_display(target)
+        if ok is False:
+            focus_text = "Focused: None"
+        elif name or code:
+            if name and code and code not in name:
+                focus_text = f"Focused: {name} ({code})"
+            else:
+                focus_text = f"Focused: {name or code}"
+        else:
+            focus_text = "Focused: --"
+        self.weapon_focus_lbl.setText(f"{focus_text} | Target: {target_label}")
+        if cls:
+            tip_parts = []
+            if name or code:
+                tip_parts.append(f"{name or ''}{f' ({code})' if code else ''}".strip())
+            tip_parts.append(str(cls))
+            self.weapon_focus_lbl.setToolTip("\n".join([p for p in tip_parts if p]))
+        else:
+            self.weapon_focus_lbl.setToolTip("")
+
+    def _on_weapon_target_changed(self):
+        self._set_weapon_focus_label(None, None, self._weapon_target_name(), None)
+        self._refresh_weapon_state()
+
+    def _refresh_weapon_targets(self, current=None):
+        if not self.weapon_target_combo:
+            return
+        self.weapon_target_combo.blockSignals(True)
+        self.weapon_target_combo.clear()
+
+        self_name = self._self_name
+        others = []
+        for name in self._player_names:
+            if self_name and str(name).strip().lower() == str(self_name).strip().lower():
+                continue
+            others.append(name)
+
+        if not others and not self_name:
+            self.weapon_target_combo.addItem("No Players Found", "SELF")
+            self.weapon_target_combo.setEnabled(False)
+        else:
+            self.weapon_target_combo.setEnabled(True)
+            if self_name:
+                self.weapon_target_combo.addItem(f"{self_name} (Self)", "SELF")
+            else:
+                self.weapon_target_combo.addItem("Self", "SELF")
+            for name in sorted(others, key=lambda s: str(s).lower()):
+                self.weapon_target_combo.addItem(name, name)
+            if current:
+                idx = self.weapon_target_combo.findData(current)
+                if idx >= 0:
+                    self.weapon_target_combo.setCurrentIndex(idx)
+        self.weapon_target_combo.blockSignals(False)
+        self._set_weapon_focus_label(None, None, self._weapon_target_name(), None)
+
     def _with_target(self, base: str) -> str:
         t = self._target_text()
         if t:
@@ -1217,6 +2470,132 @@ class ActionPanel(QWidget):
         if not t:
             return
         self._send("bringplayer", t)
+
+    def _set_weapon_damage(self):
+        if not self.weapon_dmg_input:
+            return
+        raw = str(self.weapon_dmg_input.text() or "").strip()
+        if not raw:
+            self.show_toast("Enter a damage value.", "WARN", 2000)
+            return
+        try:
+            dmg = float(raw)
+        except Exception:
+            self.show_toast("Invalid damage value.", "ERROR", 2200)
+            return
+        arg = self._weapon_arg_with_target(str(dmg))
+        self._send("setweapondmg", arg)
+
+    def _toggle_unlimited_ammo(self):
+        state = "on" if self.weapon_unlimited_cb.isChecked() else "off"
+        arg = self._weapon_arg_with_target(state)
+        self._send("unlimitedammo", arg)
+
+    def _max_ammo(self):
+        arg = self._weapon_arg_with_target("")
+        self._send("maxammo", arg)
+
+    def _weapon_goto(self, code: str):
+        code = str(code or "").strip().upper()
+        if not code:
+            return
+        self._send("gotoweapon", code)
+
+    def _weapon_bring(self, code: str):
+        code = str(code or "").strip().upper()
+        if not code:
+            return
+        self._send("bringweapon", code)
+
+    def _refresh_weapon_state(self):
+        if self._ack_handlers:
+            return False
+        target = self._weapon_target_name()
+        arg = "" if target.lower() == "self" else target
+        cmd_id = self._send("weapon_gui_state", arg)
+        if not cmd_id:
+            return False
+        self._last_weapon_state_request = time.monotonic()
+        self._queue_ack(cmd_id, self._handle_weapon_state_ack, 1.5)
+        return True
+
+    def _handle_weapon_state_ack(self, ok: bool, msg: str):
+        if not ok or not msg.startswith("WEAPONSTATE="):
+            return
+        payload = msg[len("WEAPONSTATE="):]
+        data = {}
+        for part in str(payload or "").split("#"):
+            if ":" not in part:
+                continue
+            key, val = part.split(":", 1)
+            data[key.strip().upper()] = val.strip()
+        self._weapon_state = data
+        self._apply_weapon_state()
+
+    def _apply_weapon_state(self):
+        data = self._weapon_state or {}
+        ok = str(data.get("OK") or "").strip().lower() in ("1", "true", "yes", "on")
+        name = data.get("NAME") or ""
+        code = data.get("CODE") or ""
+        code_key = code.upper() if code else ""
+        target = data.get("TARGET") or ""
+        cls = data.get("CLASS") or ""
+
+        current_target = self._weapon_target_name()
+        if target and current_target and target.lower() != current_target.lower():
+            return
+
+        if not ok:
+            self._set_weapon_focus_label(None, None, target, False, None)
+            return
+        if not name and code:
+            name = WEAPON_LABELS.get(code_key, code)
+        self._set_weapon_focus_label(name, code_key or code, target, True, cls if cls else None)
+
+    def _tick_weapon_state(self):
+        if not self.isVisible():
+            return
+        if self._ack_handlers:
+            return
+        now = time.monotonic()
+        if (now - self._last_weapon_state_request) < 0.5:
+            return
+        self._refresh_weapon_state()
+
+    def _weapon_nearest_distances(self) -> dict:
+        out = {}
+        for entry in self._world_entries:
+            if str(entry.get("tag") or "").upper() != "WEAPON":
+                continue
+            code = str(entry.get("code") or "").upper()
+            if not code:
+                continue
+            if str(entry.get("status") or "").lower() == "collected":
+                continue
+            dist = self._world_distance(entry)
+            if dist is None:
+                continue
+            prev = out.get(code)
+            if not prev or dist < prev["dist"]:
+                out[code] = {"dist": dist, "entry": entry}
+        return out
+
+    def _refresh_weapon_rows(self):
+        if not getattr(self, "weapon_rows", None):
+            return
+        distances = self._weapon_nearest_distances()
+        for row in self.weapon_rows:
+            code = row.get("code")
+            info = distances.get(str(code or "").upper())
+            if info and info.get("dist") is not None:
+                dist = float(info["dist"])
+                row["dist"].setText(f"Nearest: {dist:.1f}m")
+                row["goto"].setEnabled(True)
+                row["bring"].setEnabled(True)
+            else:
+                row["dist"].setText("Nearest: --")
+                row["goto"].setEnabled(False)
+                row["bring"].setEnabled(False)
 
     def _heal(self):
         self._send("heal", self._with_target(""))
@@ -1260,8 +2639,34 @@ class ActionPanel(QWidget):
         self._send("invisible", self._with_target(state))
 
     def _toggle_hook_prints(self):
-        state = "on" if self.hook_prints_cb.isChecked() else "off"
+        state = "on" if self.verbose_cb.isChecked() else "off"
         self._send("hookprints", state)
+
+    def _debug_force_refresh(self):
+        self._send("state_snapshot", "")
+
+    def _debug_force_resync(self):
+        self._world_entries = []
+        self._world_self_pos = None
+        if self.world_list:
+            self.world_list.clear()
+        self._refresh_weapon_rows()
+        self._send("state_snapshot", "")
+        self._refresh_players()
+        self._refresh_tp_state()
+        self._refresh_puzzles()
+        self._refresh_contract_state()
+        self._refresh_world()
+
+    def _debug_clear_registry(self):
+        if QMessageBox.question(self, "Confirm", "Clear world registry?") != QMessageBox.Yes:
+            return
+        self._send("registry_clear", "")
+
+    def _debug_rebuild_registry(self):
+        if QMessageBox.question(self, "Confirm", "Rebuild world registry (full rescan)?") != QMessageBox.Yes:
+            return
+        self._send("registry_rebuild", "")
 
     def _on_walkspeed_slider(self, v: int):
         self.walkspeed_value_lbl.setText(str(int(v)))
@@ -1292,6 +2697,15 @@ class ActionPanel(QWidget):
         self._queue_ack(cmd_id, self._handle_puzzles_ack, 2.5)
         return True
 
+    def _refresh_contract_state(self):
+        if self._ack_handlers:
+            return False
+        cmd_id = self._send("contract_gui_state", "")
+        if not cmd_id:
+            return False
+        self._queue_ack(cmd_id, self._handle_contract_state_ack, 2.5)
+        return True
+
     def _refresh_world(self):
         if self._ack_handlers:
             return False
@@ -1316,19 +2730,21 @@ class ActionPanel(QWidget):
             started = self._refresh_tp_state()
         elif next_key == "puzzles":
             started = self._refresh_puzzles()
+        elif next_key == "contracts":
+            started = self._refresh_contract_state()
         if started:
             self._refresh_queue.pop(0)
 
     def _queue_ack(self, cmd_id, handler, timeout_s: float):
         try:
             ack_id = str(cmd_id)
-            deadline = time.time() + float(timeout_s)
+            deadline = time.monotonic() + float(timeout_s)
             self._ack_handlers[ack_id] = (deadline, handler)
         except Exception:
             pass
 
     def _cleanup_acks(self):
-        now = time.time()
+        now = time.monotonic()
         expired = [k for k, v in self._ack_handlers.items() if v[0] < now]
         for k in expired:
             del self._ack_handlers[k]
@@ -1344,6 +2760,7 @@ class ActionPanel(QWidget):
             return
         if not line:
             return
+        self._last_ack_time = time.monotonic()
         parts = line.split("|", 3)
         if len(parts) < 4 or parts[0] != "ACK":
             return
@@ -1359,6 +2776,9 @@ class ActionPanel(QWidget):
                 elif msg.startswith("TPSTATE="):
                     payload = msg[len("TPSTATE="):]
                     self._apply_tp_state(payload)
+                elif msg.startswith("CONTRACTS="):
+                    payload = msg[len("CONTRACTS="):]
+                    self._apply_contract_state(payload)
             return
         _, handler = handler_entry
         del self._ack_handlers[ack_id]
@@ -1392,6 +2812,13 @@ class ActionPanel(QWidget):
             return
         payload = msg[len("PUZZLES="):]
         self._apply_puzzles_state(payload)
+        self._run_refresh_queue()
+
+    def _handle_contract_state_ack(self, ok: bool, msg: str):
+        if not ok or not msg.startswith("CONTRACTS="):
+            return
+        payload = msg[len("CONTRACTS="):]
+        self._apply_contract_state(payload)
         self._run_refresh_queue()
 
     def _on_notice_changed(self, _path: str):
@@ -1451,6 +2878,8 @@ class ActionPanel(QWidget):
     def _process_notice_line(self, line: str):
         if not line:
             return
+        if self._handle_toast_notice(line):
+            return
         if line == self._last_notice_line:
             return
         self._last_notice_line = line
@@ -1464,6 +2893,56 @@ class ActionPanel(QWidget):
         elif line.startswith("PUZZLES="):
             payload = line[len("PUZZLES="):]
             self._apply_puzzles_state(payload)
+        elif line.startswith("CONTRACTS="):
+            payload = line[len("CONTRACTS="):]
+            self._apply_contract_state(payload)
+        elif line.startswith("PANEL="):
+            payload = line[len("PANEL="):]
+            self._apply_panel_state(payload)
+        else:
+            self.show_toast(line, "INFO", 2200)
+
+    def _handle_toast_notice(self, line: str) -> bool:
+        if not line:
+            return False
+        if not (line.startswith("SPLASH|") or line.startswith("NOTICE|") or line.startswith("ALERT|")):
+            return False
+        parts = line.split("|", 3)
+        kind = parts[0].upper()
+        default_level = "ERROR" if kind == "ALERT" else "INFO"
+        text = ""
+        duration = 2500
+        level = default_level
+
+        def _parse_int(value, fallback):
+            try:
+                return int(float(value))
+            except Exception:
+                return fallback
+
+        if len(parts) == 2:
+            text = parts[1]
+        elif len(parts) == 3:
+            if parts[1].upper() in ("INFO", "OK", "SUCCESS", "WARN", "WARNING", "ERROR", "ALERT"):
+                level = parts[1].upper()
+                text = parts[2]
+            else:
+                text = parts[1]
+                duration = _parse_int(parts[2], duration)
+        else:
+            if parts[1].upper() in ("INFO", "OK", "SUCCESS", "WARN", "WARNING", "ERROR", "ALERT"):
+                level = parts[1].upper()
+                duration = _parse_int(parts[2], duration)
+                text = parts[3]
+            else:
+                text = parts[1]
+                duration = _parse_int(parts[2], duration)
+                level = parts[3].upper() if parts[3] else default_level
+
+        text = str(text or "").strip()
+        if text:
+            self.show_toast(text, level, duration)
+        return True
 
     def _process_registry_line(self, line: str):
         if not line:
@@ -1474,11 +2953,66 @@ class ActionPanel(QWidget):
         if line.startswith("WORLD="):
             payload = line[len("WORLD="):]
             self._apply_world_list(payload)
+            self._last_registry_update = time.monotonic()
+
+    def _poll_state(self):
+        try:
+            if not self._state_path:
+                return
+            p = Path(self._state_path)
+            if not p.exists():
+                return
+            data = p.read_text(encoding="utf-8") if p.stat().st_size > 0 else ""
+        except Exception:
+            return
+
+        line = ""
+        for raw in (data or "").splitlines():
+            if raw.strip():
+                line = raw.strip()
+        if not line:
+            return
+        self._last_state_read = time.monotonic()
+        if line != self._last_state_line:
+            self._last_state_line = line
+            self._parse_state_line(line)
+        else:
+            # Still update freshness-based UI
+            self._update_info_bar()
+            self._update_debug_fields()
+
+    def _parse_state_line(self, line: str):
+        if not line.startswith("STATE="):
+            return
+        payload = line[len("STATE="):]
+        data = {}
+        for part in str(payload or "").split("#"):
+            if ":" not in part:
+                continue
+            key, val = part.split(":", 1)
+            data[key.strip().upper()] = val.strip()
+        self._state_data = data
+        panel_val = data.get("PANEL")
+        if panel_val is not None:
+            self._apply_panel_state(panel_val)
+        try:
+            self._last_state_write = float(data.get("STATEWRITE", "0") or 0)
+        except Exception:
+            self._last_state_write = 0.0
+        self._update_info_bar()
+        self._update_debug_fields()
+        self._update_contract_actions()
+
+    def _apply_panel_state(self, payload: str):
+        val = str(payload or "").strip().lower()
+        open_value = val in ("1", "true", "on", "open", "show", "yes")
+        self._emit_panel_request(open_value)
 
     def _apply_player_list(self, payload: str):
         entries = [e for e in str(payload or "").split(";") if e]
         current = self.target_combo.currentData()
         tp_current = self.tp_target_combo.currentData() if self.tp_target_combo else None
+        weapon_current = self.weapon_target_combo.currentData() if self.weapon_target_combo else None
         self.target_combo.blockSignals(True)
         self.target_combo.clear()
 
@@ -1521,6 +3055,8 @@ class ActionPanel(QWidget):
         self.target_combo.blockSignals(False)
         self._refresh_tp_targets(tp_current)
         self._refresh_tp_destinations()
+        self._refresh_weapon_targets(weapon_current)
+        self._schedule(0.2, self._refresh_weapon_state)
         self._update_target_actions()
         self._update_tp_actions()
         self._queue_followup_refreshes()
@@ -1754,6 +3290,240 @@ class ActionPanel(QWidget):
 
         self._update_puzzle_actions()
 
+    # ----------------- Contract UI -----------------
+    def _parse_contract_kv(self, value: str):
+        out = {}
+        for part in str(value or "").split(","):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            key, val = part.split("=", 1)
+            out[key.strip()] = val.strip()
+        return out
+
+    def _parse_contract_bool(self, value: str):
+        val = str(value or "").strip().lower()
+        if val in ("1", "true", "on", "yes"):
+            return True
+        if val in ("0", "false", "off", "no"):
+            return False
+        return None
+
+    def _parse_contract_int(self, value: str):
+        if value is None:
+            return None
+        try:
+            return int(float(str(value).strip()))
+        except Exception:
+            return None
+
+    def _contract_ready(self):
+        state = self._contract_state or {}
+        map_name = str(state.get("map") or "")
+        map_ok = "lobby" in map_name.strip().lower()
+        list_ok = int(state.get("lists") or 0) > 0
+        first_ok = bool(state.get("first"))
+        pawn_ok = self._state_bool("PAWN") is True
+        return map_ok and list_ok and first_ok and pawn_ok
+
+    def _sync_contract_controls_from_state(self):
+        state = self._contract_state or {}
+        values = state.get("values") or {}
+        for name, row in self._contract_controls.items():
+            if row.get("kind") == "bool":
+                raw = values.get(name)
+                val = self._parse_contract_bool(raw)
+                if val is None:
+                    val = bool(self._contract_defaults.get(name, False))
+                widget = row["widget"]
+                widget.blockSignals(True)
+                widget.setChecked(bool(val))
+                widget.blockSignals(False)
+                row["status"].setText("ON" if widget.isChecked() else "OFF")
+            else:
+                raw = values.get(name)
+                val = self._parse_contract_int(raw)
+                if val is None:
+                    val = int(self._contract_defaults.get(name, 0) or 0)
+                widget = row["widget"]
+                if row.get("dropdown"):
+                    widget.blockSignals(True)
+                    idx = widget.findData(val)
+                    if idx < 0:
+                        idx = 0
+                    widget.setCurrentIndex(idx)
+                    widget.blockSignals(False)
+                    row["status"].setText(str(widget.currentData()))
+                else:
+                    widget.blockSignals(True)
+                    widget.setText(str(val))
+                    widget.blockSignals(False)
+                    row["status"].setText(str(val))
+
+    def _update_contract_actions(self):
+        ready = self._contract_ready()
+        for row in self._contract_controls.values():
+            row["widget"].setEnabled(ready)
+            row["status"].setEnabled(ready)
+        if self.contract_apply_btn:
+            self.contract_apply_btn.setEnabled(ready)
+
+        state = self._contract_state or {}
+        map_name = str(state.get("map") or "Unknown")
+        list_count = int(state.get("lists") or 0)
+        first_ok = bool(state.get("first"))
+        hooks = int(state.get("hooks") or 0)
+        props = int(state.get("props") or 0)
+        age = state.get("age")
+
+        map_ok = "lobby" in map_name.strip().lower()
+        pawn_ok = self._state_bool("PAWN") is True
+        status_txt = "READY" if ready else "NOT READY"
+        if not map_ok:
+            status_txt = "WRONG MAP"
+        elif not pawn_ok:
+            status_txt = "NO PAWN"
+        elif not list_count:
+            status_txt = "NO LIST"
+        elif not first_ok:
+            status_txt = "NO CONTRACT"
+
+        self.contract_status_lbl.setText(f"Status: {status_txt}")
+        self.contract_map_lbl.setText(f"Map: {map_name or '--'}")
+        self.contract_lists_lbl.setText(f"Lists: {list_count}")
+        self.contract_hooks_lbl.setText(f"Hooks: {hooks}")
+        if age is None or age < 0:
+            self.contract_age_lbl.setText("Hook Age: --")
+        else:
+            self.contract_age_lbl.setText(f"Hook Age: {age:.1f}s")
+        self.contract_props_lbl.setText(f"Props: {props}")
+
+    def _apply_contract_state(self, payload: str):
+        state = {
+            "ready": False,
+            "map": "Unknown",
+            "lists": 0,
+            "first": False,
+            "props": 0,
+            "hooks": 0,
+            "age": None,
+            "types": {},
+            "values": {},
+        }
+        for part in str(payload or "").split("#"):
+            if ":" not in part:
+                continue
+            key, val = part.split(":", 1)
+            key = key.strip().upper()
+            val = val.strip()
+            if key == "READY":
+                state["ready"] = val == "1"
+            elif key == "MAP":
+                state["map"] = val or "Unknown"
+            elif key == "LISTS":
+                try:
+                    state["lists"] = int(val)
+                except Exception:
+                    state["lists"] = 0
+            elif key == "FIRST":
+                state["first"] = val == "1"
+            elif key == "PROPS":
+                try:
+                    state["props"] = int(val)
+                except Exception:
+                    state["props"] = 0
+            elif key == "HOOKS":
+                try:
+                    state["hooks"] = int(val)
+                except Exception:
+                    state["hooks"] = 0
+            elif key == "AGE":
+                try:
+                    state["age"] = float(val)
+                except Exception:
+                    state["age"] = None
+            elif key == "TYPES":
+                state["types"] = self._parse_contract_kv(val)
+            elif key == "VALUES":
+                state["values"] = self._parse_contract_kv(val)
+
+        self._contract_state = state
+        self._sync_contract_controls_from_state()
+        self._update_contract_actions()
+
+    def _on_contract_toggle(self, name: str):
+        row = self._contract_controls.get(name)
+        if not row:
+            return
+        checked = row["widget"].isChecked()
+        row["status"].setText("ON" if checked else "OFF")
+
+    def _on_contract_value_changed(self, name: str):
+        row = self._contract_controls.get(name)
+        if not row:
+            return
+        widget = row["widget"]
+        if row.get("dropdown"):
+            row["status"].setText(str(widget.currentData()))
+        else:
+            text = str(widget.text() or "").strip()
+            row["status"].setText(text if text else "--")
+
+    def _open_contracts(self):
+        self._send("opencontracts", "")
+        self._schedule(0.6, self._refresh_contract_state)
+
+    def _start_contract(self):
+        self._send("startcontract", "")
+        self._schedule(0.6, self._refresh_contract_state)
+
+    def _apply_contract(self):
+        if not self._contract_ready():
+            self.show_toast("Contract system not ready. Open the terminal in Lobby.", "WARN", 2600)
+            return
+        values = []
+        for cfg in self._contract_props:
+            name = cfg.get("name")
+            if not name:
+                continue
+            if cfg.get("exclude"):
+                val = cfg.get("default")
+                state_val = (self._contract_state.get("values") or {}).get(name)
+                if cfg.get("kind") == "bool":
+                    parsed = self._parse_contract_bool(state_val)
+                    if parsed is not None:
+                        val = parsed
+                else:
+                    parsed = self._parse_contract_int(state_val)
+                    if parsed is not None:
+                        val = parsed
+            else:
+                row = self._contract_controls.get(name)
+                if not row:
+                    val = cfg.get("default")
+                elif row.get("kind") == "bool":
+                    val = row["widget"].isChecked()
+                else:
+                    if row.get("dropdown"):
+                        parsed = self._parse_contract_int(row["widget"].currentData())
+                    else:
+                        parsed = self._parse_contract_int(row["widget"].text())
+                    if parsed is None:
+                        self.show_toast(f"Invalid number for {cfg.get('label')}.", "ERROR", 2600)
+                        return
+                    val = parsed
+            if isinstance(val, bool):
+                values.append("true" if val else "false")
+            else:
+                try:
+                    values.append(str(int(val)))
+                except Exception:
+                    values.append(str(val))
+
+        arg = " ".join(values)
+        self._send("setcontract", arg)
+        self._schedule(0.15, self._refresh_contract_state)
+
     # ----------------- World Registry UI -----------------
     def _apply_world_list(self, payload: str):
         entries = []
@@ -1804,7 +3574,123 @@ class ActionPanel(QWidget):
         self._world_self_pos = self_pos
         self.world_count_lbl.setText(f"Items: {len(entries)}")
         self._refresh_world_list()
+        self._refresh_weapon_rows()
 
+    def _state_str(self, key: str, default: str = "--") -> str:
+        return str(self._state_data.get(str(key).upper(), default))
+
+    def _state_float(self, key: str):
+        try:
+            return float(self._state_str(key, ""))
+        except Exception:
+            return None
+
+    def _state_bool(self, key: str) -> bool | None:
+        val = str(self._state_data.get(str(key).upper(), "")).strip()
+        if val == "":
+            return None
+        return val in ("1", "true", "yes", "on")
+
+    def _update_info_bar(self):
+        now = time.monotonic()
+        map_name = self._state_str("MAP", "Unknown")
+        world_ready = self._state_bool("WORLD")
+        pawn_ok = self._state_bool("PAWN")
+        radar_on = self._state_bool("RADAR")
+
+        tracked = self._state_str("REGTOTAL", "0")
+
+        bridge_ok = (now - self._last_state_read) < 2.0
+        events_ok = (now - self._last_registry_update) < 3.0 if self._last_registry_update > 0 else False
+
+        status = "OK"
+        if world_ready is False or pawn_ok is False or not bridge_ok:
+            status = "WARN"
+        if world_ready is False and pawn_ok is False and map_name.lower() in ("unknown", ""):
+            if (now - self._last_state_read) > 3.0:
+                status = "ERROR"
+
+        self.info_status_lbl.setText(f"STATUS: {status}")
+        self.info_map_lbl.setText(f"MAP: {map_name}")
+        self.info_world_lbl.setText(f"WORLD: {'READY' if world_ready else 'MENU' if world_ready is False else '--'}")
+        self.info_pawn_lbl.setText(f"PAWN: {'OK' if pawn_ok else 'NONE' if pawn_ok is False else '--'}")
+        self.info_radar_lbl.setText(f"RADAR: {'ON' if radar_on else 'OFF' if radar_on is False else '--'}")
+        self.info_tracked_lbl.setText(f"TRACKED: {tracked}")
+        self.info_events_lbl.setText(f"EVENTS: {'OK' if events_ok else 'STALE'}")
+        self.info_bridge_lbl.setText(f"BRIDGE: {'OK' if bridge_ok else 'STALE'}")
+
+    def _update_debug_fields(self):
+        now = time.monotonic()
+        map_name = self._state_str("MAP", "Unknown")
+        world_ready = self._state_bool("WORLD")
+        pawn_ok = self._state_bool("PAWN")
+        radar_on = self._state_bool("RADAR")
+        proto = self._state_str("PROTO", "--")
+
+        self.debug_map_lbl.setText(f"Map: {map_name}")
+        self.debug_world_lbl.setText(f"World Ready: {str(world_ready).lower() if world_ready is not None else '--'}")
+        self.debug_pawn_lbl.setText(f"Pawn: {'valid' if pawn_ok else 'invalid' if pawn_ok is False else '--'}")
+
+        if self._world_self_pos:
+            x = self._world_self_pos.get("x", 0.0)
+            y = self._world_self_pos.get("y", 0.0)
+            z = self._world_self_pos.get("z", 0.0)
+            self.debug_pos_lbl.setText(f"Local Pos: {x:.1f} {y:.1f} {z:.1f}")
+        else:
+            self.debug_pos_lbl.setText("Local Pos: --")
+
+        self.debug_radar_lbl.setText(f"Radar: {'enabled' if radar_on else 'disabled' if radar_on is False else '--'}")
+        self.debug_proto_lbl.setText(f"Protocol: {proto}")
+
+        total = self._state_str("REGTOTAL", "0")
+        mon = self._state_str("MON", "0")
+        key = self._state_str("KEY", "0")
+        disk = self._state_str("DISK", "0")
+        black = self._state_str("BLACK", "0")
+        weapon = self._state_str("WEAPON", "0")
+        money = self._state_str("MONEY", "0")
+
+        self.debug_reg_total_lbl.setText(f"Total Tracked: {total}")
+        self.debug_reg_counts_lbl.setText(
+            f"Monsters: {mon} | Keycards: {key} | Disks: {disk} | Blackbox: {black} | Weapons: {weapon} | Money: {money}"
+        )
+
+        state_write_clock = self._state_float("STATEWRITE")
+        last_emit = self._state_float("EMIT")
+        last_prune = self._state_float("PRUNE")
+        emit_txt = "--"
+        prune_txt = "--"
+        if state_write_clock and last_emit and state_write_clock >= last_emit:
+            emit_age = state_write_clock - last_emit
+            emit_txt = f"{emit_age:.1f}s ago"
+        if state_write_clock and last_prune and state_write_clock >= last_prune:
+            prune_age = state_write_clock - last_prune
+            prune_txt = f"{prune_age:.1f}s ago"
+
+        self.debug_reg_update_lbl.setText(f"Last Registry Update: {emit_txt}")
+        self.debug_reg_prune_lbl.setText(f"Last Prune: {prune_txt}")
+
+        bridge_ok = (now - self._last_state_read) < 2.0
+        self.debug_bridge_lbl.setText(f"Bridge: {'OK' if bridge_ok else 'STALE'}")
+
+        write_txt = "--"
+        if self._last_state_read > 0:
+            write_age = now - self._last_state_read
+            write_txt = f"{write_age:.1f}s ago"
+        read_txt = f"{(now - self._last_state_read):.1f}s ago" if self._last_state_read > 0 else "--"
+        self.debug_state_write_lbl.setText(f"State Write: {write_txt}")
+        self.debug_state_read_lbl.setText(f"State Read: {read_txt}")
+
+        cmd_txt = "--"
+        if self._last_cmd_sent:
+            cmd_age = now - self._last_cmd_time if self._last_cmd_time else 0.0
+            ack_age = now - self._last_ack_time if self._last_ack_time else None
+            if ack_age is not None and self._last_ack_time > 0:
+                cmd_txt = f"{self._last_cmd_sent} | ack {ack_age:.1f}s"
+            else:
+                cmd_txt = f"{self._last_cmd_sent} | sent {cmd_age:.1f}s"
+        self.debug_cmd_lbl.setText(f"Last Cmd/Ack: {cmd_txt}")
+        self.debug_perf_lbl.setText("Perf: UI tick ~4Hz")
     def _world_category_label(self, tag: str) -> str:
         tag = str(tag or "").upper()
         if tag == "MONSTER":
@@ -2144,24 +4030,132 @@ class ActionPanel(QWidget):
 class OverlayApp:
     def __init__(self):
         self.app = QApplication([])
+        self.app.setQuitOnLastWindowClosed(False)
         self.bridge = CommandBridge(CMD_PATH)
         self.panel = ActionPanel(self.bridge.send)
-        self.panel.show()
+        self.toast_mgr = ToastManager()
+        self.panel.set_toast_manager(self.toast_mgr)
+        self.panel.set_panel_request_cb(self._on_panel_request)
 
-        # F1 toggle: global hotkey if available, focused shortcut as fallback.
-        if keyboard is not None:
-            try:
-                keyboard.add_hotkey("f1", self.toggle_panel)
-            except Exception:
-                pass
-
-    def toggle_panel(self):
-        if self.panel.isVisible():
-            self.panel.hide()
+        self._panel_requested = False
+        self._game_running = False
+        self._game_focused = False
+        self._game_pids = []
+        self.shutting_down = False
+        det = _detect_game_process()
+        if det is not None:
+            self._game_pid, self._game_exe = det
         else:
-            self.panel.show()
-            self.panel.raise_()
-            self.panel.activateWindow()
+            self._game_pid, self._game_exe = (None, None)
+
+        self.panel.hide()
+
+        self._game_timer = QTimer(self.panel)
+        self._game_timer.setInterval(2500)
+        self._game_timer.timeout.connect(self._update_game_running)
+        self._game_timer.start()
+
+        self._focus_timer = QTimer(self.panel)
+        self._focus_timer.setInterval(200)
+        self._focus_timer.timeout.connect(self._update_game_focus)
+        self._focus_timer.start()
+
+        self.process_timer = QTimer(self.panel)
+        self.process_timer.timeout.connect(self.check_game_running)
+        self.process_timer.start(PROCESS_CHECK_INTERVAL_MS)
+
+        self._update_game_running()
+        self._update_game_focus()
+        if self._game_pid is None:
+            self.toast_mgr.show(
+                "Game not found, make sure game is open before running!",
+                "ERROR",
+                3000,
+            )
+            QTimer.singleShot(3000, self.app.quit)
+
+    def _on_panel_request(self, open_value: bool):
+        self._panel_requested = open_value and True or False
+        self._apply_visibility()
+
+    def _update_game_running(self):
+        matches = _find_windows_by_title(GAME_WINDOW_TITLE)
+        running = len(matches) > 0
+        if self._game_running and not running:
+            self._panel_requested = False
+        self._game_running = running
+        pids = []
+        for hwnd, _title in matches:
+            pid = _get_pid_from_hwnd(hwnd)
+            if pid and pid not in pids:
+                pids.append(pid)
+        self._game_pids = pids
+        self._apply_visibility()
+
+    def _update_game_focus(self):
+        focused = False
+        if self._game_running:
+            title, visible, zoomed, pid = _get_foreground_title_zoomed()
+            title_ok = GAME_WINDOW_TITLE.lower() in str(title or "").lower()
+            focused = title_ok and visible and zoomed
+        if focused != self._game_focused:
+            self._game_focused = focused
+            self._apply_visibility()
+
+    def check_game_running(self):
+        if self.shutting_down:
+            return
+
+        pid = getattr(self, "_game_pid", None)
+        exe = getattr(self, "_game_exe", None)
+        if pid is None:
+            det = _detect_game_process()
+            if det is not None:
+                pid, exe = det
+                self._game_pid = pid
+                self._game_exe = exe
+            else:
+                self.shutting_down = True
+                app = QApplication.instance()
+                if app:
+                    app.quit()
+                if self.panel:
+                    self.panel.close()
+                return
+
+        if not _pid_is_alive(int(pid)):
+            self.shutting_down = True
+            app = QApplication.instance()
+            if app:
+                app.quit()
+            if self.panel:
+                self.panel.close()
+            return
+
+        if exe:
+            path = _query_process_image_name(int(pid))
+            if path:
+                base = os.path.basename(path).lower()
+                want_exact = {n.lower() for n in GAME_PROCESS_NAMES}
+                if not (base == exe or base in want_exact or base.startswith("speciesunknown")):
+                    self.shutting_down = True
+                    app = QApplication.instance()
+                    if app:
+                        app.quit()
+                    if self.panel:
+                        self.panel.close()
+
+    def _apply_visibility(self):
+        # Show whenever panel is requested and game is running.
+        # Focus/maximized gating was too strict and hid the panel.
+        should_show = self._panel_requested and self._game_running
+        if should_show:
+            if not self.panel.isVisible():
+                self.panel.show()
+                self.panel.raise_()
+        else:
+            if self.panel.isVisible():
+                self.panel.hide()
 
     def run(self):
         self.app.exec()

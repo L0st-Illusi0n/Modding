@@ -22,6 +22,17 @@ local U = nil
 local P = nil
 local TP = nil
 local R = nil
+local is_valid = _G.is_valid
+local is_world_actor = _G.is_world_actor
+local safe_get_field = _G.safe_get_field
+local safe_call = _G.safe_call
+local safe_call_err = _G.safe_call_err
+local find_all = _G.find_all
+local find_first = _G.find_first
+local split_ws = _G.split_ws
+local get_local_controller = _G.get_local_controller
+local get_local_pawn = _G.get_local_pawn
+local get_current_map = _G.get_current_map
 local open_contracts_active = false
 local start_contract_active = false
 local esc_bound = false
@@ -31,6 +42,227 @@ local LAB_TERMINAL_CLASS = "BP_GAZ_Control_Terminal_REFACT_C"
 local LAB_STATUT_PROP = "Statut"
 local LAB_VALID_PROP = "Valid_8_9608484544DD1DEA4EC52BA6611258C1"
 local LAB_LETTER_PROP = "Letter_13_494532284D3C19CA68C680B6321D6353"
+local CONTRACT_PROP_ORDER = {
+    "Valid_13_7EC50B9D43830CC60C6CFB89C4A56633",
+    "ContractType_2_AD7B8E08435CF5A38556E7BA67C34760",
+    "Difficulty_5_84E907A245C9C4C6CA73B4B492F85329",
+    "Map_33_3AB0E6BD42FE920DECF2A89E52105CBF",
+    "Bonus_37_1897E8074DDDA168BDAA24BC50497746",
+    "RespawnTicket_8_A88C5BA64BADD031647C7BBAB7B1DCD3",
+    "PowerAtStart_11_C457EA0B40DD327B66E17FBA29A033CD",
+    "PirateInfasion_16_0C40614A4525CF1F61426D8C1612CD02",
+    "ExplosiveItems_26_911C078943295906DC83AD9AE6E41C50",
+    "WeaponsCat1_18_791AA0694D75543C3E72E9BF6CBDDED7",
+    "WeaponsCat2_20_3287E6454140FA9F9FAEA2BBE0683E3A",
+    "WeaponBeep_30_A709702A49C40150494FC5A3BC396644",
+    "PaidAmmoAndHealingPoint_28_DD503146439664BB746EE4BCD5F9EB11",
+    "PowerInstable_43_08F6519448E0B007804A8E98E1C81DBB",
+    "Turret_44_40482A9D49BF678F60534D8484469ECC",
+    "TimeLimit_23_33123F0347EBBAC12A84EF8683EDF14B",
+    "MaxBounty_40_41D52ADA489C1A0CC271FC8E07865CA3",
+    "TestModif_46_FC4300D547CDC9E3BD1A80B3F37854FB",
+}
+
+local function sanitize_notice_text(s)
+    s = tostring(s or "")
+    s = s:gsub("[\r\n|]", " ")
+    s = s:gsub("%s+", " ")
+    return s:match("^%s*(.-)%s*$")
+end
+
+local function notify(text, level, duration_ms)
+    local bridge = _G.BlackboxRecode and _G.BlackboxRecode.BridgeNotice
+    if type(bridge) ~= "function" then
+        return
+    end
+    local msg = sanitize_notice_text(text)
+    if msg == "" then
+        return
+    end
+    local lvl = tostring(level or "INFO"):upper()
+    local dur = tonumber(duration_ms) or 2400
+    bridge(string.format("SPLASH|%s|%d|%s", lvl, math.floor(dur), msg))
+end
+
+local function notify_ok(text, duration_ms)
+    notify(text, "OK", duration_ms or 2200)
+end
+
+local function notify_warn(text, duration_ms)
+    notify(text, "WARN", duration_ms or 2800)
+end
+
+local function notify_err(text, duration_ms)
+    notify(text, "ERROR", duration_ms or 3200)
+end
+
+local function set_hook_prints(enable)
+    _G.BlackboxRecode = _G.BlackboxRecode or {}
+    _G.BlackboxRecode.HookPrints = enable and true or false
+    return _G.BlackboxRecode.HookPrints
+end
+
+local function try_require_socket()
+    local candidates = { "socket", "socket.core", "luasocket" }
+    for _, name in ipairs(candidates) do
+        local ok, mod = pcall(require, name)
+        if ok and mod then
+            return mod, name
+        end
+    end
+    if type(_G.socket) == "table" then
+        return _G.socket, "_G.socket"
+    end
+    return nil, nil
+end
+
+local function resolve_ufunction(name)
+    if not _G.StaticFindObject then
+        return nil
+    end
+    local n = tostring(name or "")
+    if n == "" then return nil end
+    local candidates = {}
+    candidates[#candidates + 1] = n
+    if n:sub(1, 9) ~= "Function " then
+        candidates[#candidates + 1] = "Function " .. n
+    end
+    for _, lookup in ipairs(candidates) do
+        local ok, obj = pcall(_G.StaticFindObject, lookup)
+        if ok and obj then
+            return obj
+        end
+    end
+    return nil
+end
+
+local function is_ufunction(obj)
+    if obj == nil or type(obj) ~= "userdata" then
+        return false
+    end
+    if obj.type then
+        local ok, t = pcall(obj.type, obj)
+        if ok and t == "UFunction" then
+            return true
+        end
+    end
+    return false
+end
+
+local function call_ufunction_on(obj, ufn, ...)
+    if not is_valid(obj) then
+        return false, "invalid_obj"
+    end
+    if not is_ufunction(ufn) then
+        return false, "invalid_ufunction"
+    end
+    local last_err = nil
+
+    local cf = safe_get_field(obj, "CallFunction")
+    if type(cf) == "function" then
+        local ok, res = pcall(cf, obj, ufn, ...)
+        if ok then
+            return true, res
+        end
+        last_err = res
+    elseif type(cf) == "userdata" and is_ufunction(cf) then
+        local ok, res = pcall(cf, obj, ufn, ...)
+        if ok then
+            return true, res
+        end
+        last_err = res
+        ok, res = pcall(cf, ufn, ...)
+        if ok then
+            return true, res
+        end
+        last_err = res
+    end
+
+    local ok, res = pcall(ufn, obj, ...)
+    if ok then
+        return true, res
+    end
+    last_err = res
+
+    return false, last_err or "call failed"
+end
+
+local function interact_ship_seat(pawn)
+    if not is_valid(pawn) then
+        return false, "local player not found"
+    end
+
+    local seats = find_all("BP_Seat_C")
+    if seats == nil then
+        seats = {}
+    elseif type(seats) ~= "table" then
+        local out = {}
+        local okn, n = safe_call(seats, "Num")
+        if not okn or type(n) ~= "number" then
+            okn, n = safe_call(seats, "GetArrayNum")
+        end
+        if okn and type(n) == "number" and n > 0 then
+            for i = 0, n - 1 do
+                local ok, v = safe_call(seats, "Get", i)
+                if not ok then
+                    ok, v = pcall(function() return seats[i] end)
+                end
+                if ok and v ~= nil then
+                    out[#out + 1] = v
+                end
+            end
+        end
+        seats = out
+    end
+
+    local function seat_idx(obj)
+        if not is_valid(obj) then return nil end
+        local name = nil
+        if obj.GetFullName then
+            local ok, full = pcall(obj.GetFullName, obj)
+            if ok and full then
+                name = tostring(full)
+            end
+        end
+        if not name and obj.GetName then
+            local ok, n = pcall(obj.GetName, obj)
+            if ok and n then
+                name = tostring(n)
+            end
+        end
+        name = tostring(name or "")
+        local idx = name:match("_(%d+)%s*$") or name:match("_(%d+)$")
+        return tonumber(idx)
+    end
+
+    local ordered = {}
+    for _, seat in ipairs(seats) do
+        local idx = seat_idx(seat)
+        if idx ~= nil and idx >= 0 and idx <= 3 then
+            ordered[#ordered + 1] = { idx = idx, seat = seat }
+        end
+    end
+    table.sort(ordered, function(a, b) return a.idx < b.idx end)
+    local chosen = nil
+    for _, entry in ipairs(ordered) do
+        local seat = entry.seat
+        if is_valid(seat) then
+            local used = safe_get_field(seat, "IsUsed")
+            if used == false or used == 0 or used == "false" or used == "0" or used == nil then
+                chosen = seat
+                break
+            end
+        end
+    end
+    if not chosen then
+        return false, "no free seat found"
+    end
+    local ok = select(1, safe_call(chosen, "BPI_Interactable_Input", pawn))
+    if ok then
+        return true, "ok"
+    end
+    return false, "interaction failed"
+end
 
 local function ensure_keybinds()
     if esc_bound then return end
@@ -58,11 +290,29 @@ local function ensure_keybinds()
             handled = true
             print("[StartContract] ESC detected...")
             if TP and TP.teleport then
-                local ok, msg = TP.teleport("LOBBY:ship", nil, false)
-                if ok then
-                    print("[StartContract] Teleported to ship.")
+                local function do_ship_return()
+                    local ok, msg = TP.teleport("LOBBY:ship", nil, false)
+                    if ok then
+                        print("[StartContract] Teleported to ship.")
+                        local pawn = get_local_pawn and get_local_pawn() or nil
+                        local ok_seat, msg_seat = interact_ship_seat(pawn)
+                        if ok_seat then
+                            print("[StartContract] Seated.")
+                        else
+                            print("[StartContract] Seat interact failed: " .. tostring(msg_seat))
+                        end
+                    else
+                        print("[StartContract] " .. tostring(msg))
+                    end
+                end
+
+                if _G.LoopAsync then
+                    LoopAsync(1000, function()
+                        do_ship_return()
+                        return true
+                    end)
                 else
-                    print("[StartContract] " .. tostring(msg))
+                    do_ship_return()
                 end
             end
         end
@@ -75,91 +325,33 @@ local function ensure_keybinds()
     esc_bound = true
 end
 
-local function split_ws(s)
-    s = tostring(s or "")
-    local out = {}
-    for part in s:gmatch("%S+") do
-        out[#out + 1] = part
+local function describe_obj(obj)
+    if obj == nil then return "<nil>" end
+    local parts = {}
+    local ok, s = pcall(function() return tostring(obj) end)
+    if ok and s then parts[#parts + 1] = "tostring=" .. tostring(s) end
+    local fn_full = safe_get_field(obj, "GetFullName")
+    if type(fn_full) == "function" then
+        local ok2, v = pcall(fn_full, obj)
+        if ok2 and v then parts[#parts + 1] = "full=" .. tostring(v) end
     end
-    return out
-end
-
-local function set_hook_prints(enable)
-    _G.BlackboxRecode = _G.BlackboxRecode or {}
-    _G.BlackboxRecode.HookPrints = enable and true or false
-    return _G.BlackboxRecode.HookPrints
-end
-
-local function try_require_socket()
-    local candidates = { "socket", "socket.core", "luasocket" }
-    for _, name in ipairs(candidates) do
-        local ok, mod = pcall(require, name)
-        if ok and mod then
-            return mod, name
+    local fn_name = safe_get_field(obj, "GetName")
+    if type(fn_name) == "function" then
+        local ok2, v = pcall(fn_name, obj)
+        if ok2 and v then parts[#parts + 1] = "name=" .. tostring(v) end
+    end
+    local fn_class = safe_get_field(obj, "GetClass")
+    if type(fn_class) == "function" then
+        local okc, cls = pcall(fn_class, obj)
+        if okc and cls then
+            local ok3, s2 = pcall(function() return tostring(cls) end)
+            if ok3 and s2 then parts[#parts + 1] = "class=" .. tostring(s2) end
         end
     end
-    if type(_G.socket) == "table" then
-        return _G.socket, "_G.socket"
+    if #parts == 0 then
+        return "<obj>"
     end
-    return nil, nil
-end
-
-local function is_valid(obj)
-    if not obj then return false end
-    if obj.IsValid then
-        local ok, v = pcall(obj.IsValid, obj)
-        return ok and v
-    end
-    return true
-end
-
-local function safe_get_field(obj, field)
-    if obj == nil then return nil end
-    local ok, val = pcall(function() return obj[field] end)
-    if ok then return val end
-    return nil
-end
-
-local function safe_call(obj, field, ...)
-    local fn = safe_get_field(obj, field)
-    if type(fn) ~= "function" then
-        return false, nil
-    end
-    local ok, res = pcall(fn, obj, ...)
-    if ok then
-        return true, res
-    end
-    return false, nil
-end
-
-local function find_all(class_name)
-    if not class_name or class_name == "" then return nil end
-    if _G.FindAllOf then
-        local ok, res = pcall(_G.FindAllOf, class_name)
-        if ok then return res end
-    end
-    if _G.UE and UE.FindAllOf then
-        local ok, res = pcall(UE.FindAllOf, class_name)
-        if ok then return res end
-    end
-    return nil
-end
-
-local function find_first(class_name)
-    if not class_name or class_name == "" then return nil end
-    if _G.FindFirstOf then
-        local ok, res = pcall(_G.FindFirstOf, class_name)
-        if ok then return res end
-    end
-    if _G.UE and UE.FindFirstOf then
-        local ok, res = pcall(UE.FindFirstOf, class_name)
-        if ok then return res end
-    end
-    local all = find_all(class_name)
-    if all and #all > 0 then
-        return all[1]
-    end
-    return nil
+    return table.concat(parts, " ")
 end
 
 local function iter_children(children, fn)
@@ -401,6 +593,480 @@ local function parse_bool(v)
         return false
     end
     return nil
+end
+
+local function unwrap_param(obj)
+    if obj == nil then return nil end
+    local t = type(obj)
+    if t ~= "userdata" and t ~= "table" then
+        return obj
+    end
+    for _, name in ipairs({ "get", "Get", "GetValue" }) do
+        local fn = safe_get_field(obj, name)
+        if type(fn) == "function" then
+            local ok, val = pcall(fn, obj)
+            if ok and val ~= nil and val ~= obj then
+                return val
+            end
+        end
+    end
+    for _, name in ipairs({ "Value", "value", "Val", "val", "Data", "data" }) do
+        local val = safe_get_field(obj, name)
+        if val ~= nil and val ~= obj then
+            return val
+        end
+    end
+    return obj
+end
+
+local function get_prop_name(prop)
+    if not prop or not prop.GetFName then return nil end
+    local okn, fn = pcall(prop.GetFName, prop)
+    if okn and fn and fn.ToString then
+        local ok2, s = pcall(fn.ToString, fn)
+        if ok2 and s then return tostring(s) end
+    end
+    return nil
+end
+
+local function get_prop_class_name(prop)
+    if not prop then return "Property" end
+    local fn_cls = safe_get_field(prop, "GetClass")
+    if type(fn_cls) == "function" then
+        local okc, cls = pcall(fn_cls, prop)
+        if okc and cls then
+            local fn_name = safe_get_field(cls, "GetFName")
+            if type(fn_name) == "function" then
+                local okn, nm = pcall(fn_name, cls)
+                if okn and nm and nm.ToString then
+                    local ok2, s = pcall(nm.ToString, nm)
+                    if ok2 and s then
+                        return tostring(s)
+                    end
+                end
+            end
+        end
+    end
+    return "Property"
+end
+
+local function build_contract_prop_types(contract_struct)
+    local types = {}
+    if not contract_struct or not contract_struct.ForEachProperty then
+        return types
+    end
+    pcall(function()
+        contract_struct:ForEachProperty(function(prop)
+            local name = get_prop_name(prop)
+            if name and name ~= "" then
+                types[name] = get_prop_class_name(prop)
+            end
+        end)
+    end)
+    return types
+end
+
+local function get_contract_lists()
+    local bb = _G.BlackboxRecode or {}
+    local lists = {}
+    if type(bb.ContractLists) == "table" then
+        for _, arr in pairs(bb.ContractLists) do
+            if arr ~= nil then
+                lists[#lists + 1] = arr
+            end
+        end
+    elseif bb.ContractList then
+        lists[#lists + 1] = bb.ContractList
+    end
+    return lists
+end
+
+local function get_ui_cache()
+    local bb = _G.BlackboxRecode or {}
+    if type(bb.UI) == "table" then
+        return bb.UI
+    end
+    return nil
+end
+
+local function get_ui_obj(ui, key)
+    if not ui or type(ui) ~= "table" then return nil end
+    local obj = ui[key]
+    if is_valid(obj) then
+        return obj
+    end
+    return nil
+end
+
+local function has_contract_ui(ui)
+    if not ui or type(ui) ~= "table" then return false end
+    local keys = {
+        "ContractTerminal",
+        "MainContractManager",
+        "ChoosePage",
+        "DetailPage",
+        "RecapPage",
+        "MapDetailsPage",
+    }
+    for _, key in ipairs(keys) do
+        if is_valid(ui[key]) then
+            return true
+        end
+    end
+    return false
+end
+
+local function get_contract_world_context(ui)
+    local keys = {
+        "ContractTerminal",
+        "MainContractManager",
+        "ChoosePage",
+        "DetailPage",
+        "RecapPage",
+        "MapDetailsPage",
+    }
+    for _, key in ipairs(keys) do
+        local obj = get_ui_obj(ui, key)
+        if obj then return obj end
+    end
+    return nil
+end
+
+local function get_contract_refresh_kv(ui)
+    local bb = _G.BlackboxRecode or {}
+    local key = bb.ContractRefreshKey or bb.ContractReplicatorKey
+    local val = bb.ContractRefreshValue or bb.ContractReplicatorValue
+    local alt = bb.ContractRefreshAltValue or bb.ContractReplicatorAltValue
+    if ui and type(ui) == "table" then
+        key = key or ui.RefreshKey or ui.ReplicatorKey
+        val = val or ui.RefreshValue or ui.ReplicatorValue
+        alt = alt or ui.RefreshAltValue or ui.ReplicatorAltValue
+    end
+    return key, val, alt
+end
+
+local function reorganize_contract_list(list, world_context)
+    if list == nil then return nil, false, "no_list" end
+    local lib = _G.BP_Mission_FunctionLibrairy_C or BP_Mission_FunctionLibrairy_C
+    if not lib and _G.StaticFindObject then
+        local ok, obj = pcall(_G.StaticFindObject, "BP_Mission_FunctionLibrairy_C")
+        if ok then lib = obj end
+    end
+    if not lib then
+        return nil, false, "no_lib"
+    end
+    local ok, res, err = safe_call_err(lib, "ReorganizeContractList", list, world_context)
+    if ok and res ~= nil then
+        return res, true, "ok"
+    end
+    if err == "missing" then
+        return nil, false, "missing_fn"
+    end
+    if err ~= nil then
+        return nil, false, "error:" .. tostring(err)
+    end
+    if res == nil then
+        return nil, false, "returned_nil"
+    end
+    return nil, false, "call_failed"
+end
+
+local function push_contract_list_to_ui(final_list, ui, verbose)
+    if final_list == nil then
+        return false, "no_list"
+    end
+    ui = ui or get_ui_cache()
+    if not ui then
+        return false, "no_ui"
+    end
+
+    local targets = {
+        { get_ui_obj(ui, "ContractTerminal"), "BPI_ContractTerminal_SetContractList", "terminal" },
+        { get_ui_obj(ui, "MainContractManager"), "BPI_ContractTerminal_SetContractList", "manager" },
+        { get_ui_obj(ui, "ChoosePage"), "SetContractList", "choose_set" },
+        { get_ui_obj(ui, "ChoosePage"), "BPI_ContractTerminal_SetContractList", "choose_bpi" },
+    }
+
+    for _, entry in ipairs(targets) do
+        local obj, fn = entry[1], entry[2]
+        if not is_valid(obj) then
+            if verbose then
+                print(string.format("[setcontract] SetContractList target %s: invalid", tostring(entry[3])))
+            end
+        else
+            local func = safe_get_field(obj, fn)
+            if type(func) ~= "function" then
+                if verbose then
+                    print(string.format("[setcontract] SetContractList target %s: missing %s (%s)",
+                        tostring(entry[3]), tostring(fn), describe_obj(obj)))
+                end
+            else
+                local ok_call, err = pcall(func, obj, final_list)
+                if ok_call then
+                    return true, entry[3]
+                end
+                if verbose then
+                    print(string.format("[setcontract] SetContractList target %s: error %s",
+                        tostring(entry[3]), tostring(err)))
+                end
+            end
+        end
+    end
+    return false, "no_target"
+end
+
+local function force_contract_ui_refresh(ui, verbose)
+    ui = ui or get_ui_cache()
+    if not ui then
+        return false, "no_ui"
+    end
+
+    -- Option A: replicator chain
+    local fail_reason = nil
+    local term = get_ui_obj(ui, "ContractTerminal")
+    if term then
+        local ok_rep, rep, err = safe_call_err(term, "BPI_TerminalReplicator_GetDynReplicator")
+        if ok_rep and rep then
+            local key, val, alt = get_contract_refresh_kv(ui)
+            if key ~= nil and val ~= nil then
+                if alt ~= nil and alt ~= val then
+                    safe_call(rep, "SetInt", key, alt)
+                end
+                local ok_set = safe_call(rep, "SetInt", key, val)
+                if ok_set then
+                    return true, "replicator"
+                end
+                fail_reason = "replicator_set_failed"
+            else
+                fail_reason = "replicator_missing_kv"
+            end
+        elseif ok_rep and rep == nil then
+            fail_reason = "replicator_nil"
+        elseif err == "missing" then
+            fail_reason = "replicator_missing_fn"
+        else
+            fail_reason = "replicator_call_error"
+        end
+    else
+        fail_reason = "no_terminal"
+    end
+
+    -- Option B: index change / manager rebuild
+    local mgr = get_ui_obj(ui, "MainContractManager")
+    if mgr then
+        local idx = safe_get_field(mgr, "CurrentIndex")
+        if type(idx) ~= "number" then
+            idx = safe_get_field(mgr, "Index")
+        end
+        if type(idx) ~= "number" then
+            idx = safe_get_field(mgr, "CurrentPageIndex")
+        end
+        if type(idx) ~= "number" then
+            idx = 0
+        end
+        if safe_call(mgr, "OnIndexChanged", idx) then
+            return true, "indexchanged"
+        end
+        if safe_call(mgr, "SwitchPage", idx) then
+            return true, "switchpage"
+        end
+        if safe_call(mgr, "OnBreadcrumbPageChanged", idx) then
+            return true, "breadcrumb"
+        end
+        if fail_reason == nil then
+            fail_reason = "manager_call_failed"
+        end
+    end
+
+    -- Option C: brute-force setup calls
+    local function call_setup(obj, fn_name, args)
+        if not is_valid(obj) then return false end
+        local fn = safe_get_field(obj, fn_name)
+        if type(fn) ~= "function" then return false end
+        if type(args) == "table" then
+            local ok = pcall(fn, obj, table.unpack(args))
+            if ok then return true end
+        end
+        local ok2 = pcall(fn, obj)
+        return ok2 and true or false
+    end
+
+    local bb = _G.BlackboxRecode or {}
+    local ok_any = false
+    if call_setup(get_ui_obj(ui, "DetailPage"), "SetupContractDetailPage", ui.DetailPageArgs or bb.ContractDetailPageArgs) then
+        ok_any = true
+    end
+    if call_setup(get_ui_obj(ui, "RecapPage"), "SetupContractRecapPage", ui.RecapPageArgs or bb.ContractRecapPageArgs) then
+        ok_any = true
+    end
+    if call_setup(get_ui_obj(ui, "MapDetailsPage"), "SetupMapDetailPage", ui.MapDetailsPageArgs or bb.ContractMapDetailsPageArgs) then
+        ok_any = true
+    end
+    if ok_any then
+        return true, "setup"
+    end
+    if fail_reason then
+        return false, fail_reason
+    end
+    return false, "no_widgets"
+end
+
+local function build_contract_values(contract_struct)
+    local values = {}
+    if not contract_struct then
+        return values
+    end
+    for i = 1, #CONTRACT_PROP_ORDER do
+        local name = CONTRACT_PROP_ORDER[i]
+        local val = get_struct_field(contract_struct, name)
+        if val ~= nil then
+            local t = type(val)
+            if t == "boolean" then
+                values[name] = val and "1" or "0"
+            elseif t == "number" then
+                values[name] = tostring(math.floor(val))
+            else
+                values[name] = tostring(val)
+            end
+        end
+    end
+    return values
+end
+
+local function encode_contract_pairs(values, order, include_empty)
+    local parts = {}
+    for i = 1, #order do
+        local name = order[i]
+        local v = values and values[name]
+        if v == nil then
+            if include_empty then
+                parts[#parts + 1] = tostring(name) .. "="
+            end
+        else
+            parts[#parts + 1] = tostring(name) .. "=" .. tostring(v)
+        end
+    end
+    return table.concat(parts, ",")
+end
+
+local function get_first_contract_struct(arr)
+    if not arr then return nil end
+    local elem = nil
+    local ok_each = safe_call(arr, "ForEach", function(_idx, e)
+        elem = e
+        return true
+    end)
+    if not ok_each or elem == nil then
+        local ok, v = safe_call(arr, "Get", 0)
+        if ok then
+            elem = v
+        end
+    end
+    if elem == nil then
+        local ok, v = pcall(function() return arr[0] end)
+        if ok then elem = v end
+    end
+    return unwrap_param(elem)
+end
+
+local function print_setcontract_help(types)
+    print("[setcontract] Usage: setcontract <" .. tostring(#CONTRACT_PROP_ORDER) .. " values> | setcontract help")
+    print("[setcontract] Example: setcontract true 3 0 0 0 9 false false true true true true false false false 0 1000 false")
+    print("[setcontract] Applies to the first contract in each active list screen.")
+    print("[setcontract] Order:")
+    for i = 1, #CONTRACT_PROP_ORDER do
+        local name = CONTRACT_PROP_ORDER[i]
+        local ptype = types and types[name] or "UnknownProperty"
+        print(string.format("[setcontract] %02d %s (%s)", i, name, ptype))
+    end
+end
+
+local function apply_contract_values(contract_struct, values)
+    if not contract_struct then return false end
+    local ok_any = false
+    for name, val in pairs(values or {}) do
+        if set_struct_field(contract_struct, name, val) then
+            ok_any = true
+        end
+    end
+    return ok_any
+end
+
+local function apply_contract_list_first(arr, values)
+    if not arr then return 0 end
+    local first = get_first_contract_struct(arr)
+    if not first then return 0 end
+    return apply_contract_values(first, values) and 1 or 0
+end
+
+local POWER_PROP_FALLBACK = {
+    "bPowerOn",
+    "PowerOn",
+    "bIsPowerOn",
+    "Power",
+    "bLightOn",
+    "LightOn",
+    "bIsLightOn",
+    "LightsOn",
+    "bLightsOn",
+    "LightStatut",
+    "PowerStatut",
+    "Statut",
+}
+
+local function _call_change_light(gs, arg0, arg1)
+    local last_err = nil
+    local ufn = resolve_ufunction("Function /Game/Blueprints/Core/BP_MyGameState.BP_MyGameState_C:ChangeLightStatut")
+    if ufn then
+        local ok, err = call_ufunction_on(gs, ufn, arg0, arg1)
+        if ok then
+            return true
+        end
+        last_err = err
+    end
+    if safe_call and safe_call(gs, "ChangeLightStatut", arg0, arg1) then
+        return true
+    end
+    if safe_call and safe_call(gs, "ChangeLightStatut", arg1) then
+        return true
+    end
+    return false, last_err
+end
+
+local function _set_power_state(enable)
+    local gs = find_first("BP_MyGameState_C")
+    if not is_valid(gs) then
+        print("[Power] BP_MyGameState_C not found (be in-game, not main menu).")
+        return false
+    end
+
+    local bool_val = enable and true or false
+    local num_val = enable and 1 or 0
+
+    -- HookWatch shows ChangeLightStatut(0, true) in live calls, so try 2-arg then 1-arg.
+    local ok, err = _call_change_light(gs, 0, bool_val)
+    if not ok then
+        ok, err = _call_change_light(gs, 0, num_val)
+    end
+
+    local updated = 0
+    for _, prop in ipairs(POWER_PROP_FALLBACK) do
+        if set_prop(gs, prop, bool_val) or set_prop(gs, prop, num_val) then
+            updated = updated + 1
+        end
+    end
+
+    if ok or updated > 0 then
+        print("[Power] " .. (enable and "ON" or "OFF") .. " via GameState (" .. tostring(updated) .. " fields).")
+        return true
+    end
+
+    if err == "invalid_obj" then
+        print("[Power] BP_MyGameState_C is nullptr/invalid right now (wrong map, main menu, or loading).")
+    else
+        print("[Power] Failed to update GameState power fields.")
+    end
+    return false
 end
 
 local function set_base_walk_speed(target, speed)
@@ -1331,8 +1997,10 @@ get_all_monsters = function()
     return out
 end
 
-local function get_player_weapon()
-    local pawn = TP and TP.get_local_pawn and TP.get_local_pawn() or nil
+local function get_player_weapon(pawn)
+    if not pawn then
+        pawn = get_local_pawn and get_local_pawn() or nil
+    end
     if not pawn then return nil end
     local fields = { "CurrentWeapon", "EquippedWeapon", "Weapon", "ActiveWeapon" }
     for _, f in ipairs(fields) do
@@ -1359,6 +2027,58 @@ get_all_weapons = function()
         end
     end
     return out
+end
+
+local function humanize_key(key)
+    key = tostring(key or "")
+    if key == "" then return key end
+    key = key:gsub("_", " ")
+    key = key:gsub("([a-z])([A-Z])", "%1 %2")
+    key = key:gsub("(%a)(%d)", "%1 %2")
+    key = key:gsub("%s+", " ")
+    return key:match("^%s*(.-)%s*$")
+end
+
+local function sanitize_state_token(s)
+    s = tostring(s or "")
+    s = s:gsub("[#:%|;\r\n]", " ")
+    s = s:gsub("%s+", " ")
+    return s:match("^%s*(.-)%s*$")
+end
+
+local function weapon_meta_from_obj(obj)
+    if not obj then return nil end
+    local full = ""
+    if obj.GetFullName then
+        local ok, v = pcall(obj.GetFullName, obj)
+        if ok and v then full = tostring(v) end
+    end
+    local name = get_actor_name(obj)
+    local class_name = ""
+    if obj.GetClass then
+        local okc, cls = pcall(obj.GetClass, obj)
+        if okc and cls and cls.GetName then
+            local okn, cn = pcall(cls.GetName, cls)
+            if okn and cn then class_name = tostring(cn) end
+        end
+    end
+    if P and P.WEAPONS then
+        for key, info in pairs(P.WEAPONS) do
+            if info and info.class then
+                local cls = tostring(info.class)
+                if (full ~= "" and full:find(cls, 1, true))
+                    or (name ~= "" and name:find(cls, 1, true))
+                    or (class_name ~= "" and class_name:find(cls, 1, true)) then
+                    return {
+                        name = humanize_key(key),
+                        code = tostring(info.code or ""),
+                        class = cls,
+                    }
+                end
+            end
+        end
+    end
+    return nil
 end
 
 local function find_player_by_name(query)
@@ -1412,8 +2132,8 @@ local function parse_target_args(args)
     local pawn = nil
     if target_entry then
         pawn = target_entry.pawn
-    elseif TP and TP.get_local_pawn then
-        pawn = TP.get_local_pawn()
+    elseif get_local_pawn then
+        pawn = get_local_pawn()
     end
     return pawn, target_name, out
 end
@@ -1455,31 +2175,41 @@ local function reg(cmd, fn, help, category)
     }
 
     -- register console command
-    local has_global = _G.RegisterConsoleCommandGlobalHandler ~= nil
-    local has_local = _G.RegisterConsoleCommandHandler ~= nil
-    if has_global or has_local then
+    local has_global = RegisterConsoleCommandGlobalHandler ~= nil
+    if has_global then
         local callback = function(cmdline, cmd_parts, ar)
-            local args = normalize_console_args(cmd, cmdline, cmd_parts)
-            local ok, res = pcall(fn, args, cmdline, cmd_parts, ar)
-            if not ok then
+            local ok_cb, res_cb = pcall(function()
+                local args = normalize_console_args(cmd, cmdline, cmd_parts)
+                local ok, res = pcall(fn, args, cmdline, cmd_parts, ar)
+                if not ok then
+                    if U and U.err then
+                        U.err("Command error:", cmd, res)
+                    else
+                        print("[ERROR] Command error:", cmd, res)
+                    end
+                    return false
+                end
+                if type(res) == "boolean" then
+                    return res
+                end
+                return true
+            end)
+            if not ok_cb then
                 if U and U.err then
-                    U.err("Command error:", cmd, res)
+                    U.err("Command handler error:", cmd, res_cb)
                 else
-                    print("[ERROR] Command error:", cmd, res)
+                    print("[ERROR] Command handler error:", cmd, res_cb)
                 end
                 return false
             end
-            if type(res) == "boolean" then
-                return res
+            if type(res_cb) == "boolean" then
+                return res_cb
             end
             return true
         end
 
         if has_global then
             RegisterConsoleCommandGlobalHandler(cmd, callback)
-        end
-        if has_local then
-            RegisterConsoleCommandHandler(cmd, callback)
         end
     else
         if U and U.warn then
@@ -1516,6 +2246,17 @@ function Commands.init(Util, Pointers, Teleport, Registry)
     P = Pointers
     TP = Teleport
     R = Registry
+    if not is_valid and U and U.is_valid then is_valid = U.is_valid end
+    if not is_world_actor and U and U.is_world_actor then is_world_actor = U.is_world_actor end
+    if not safe_get_field and U and U.safe_get_field then safe_get_field = U.safe_get_field end
+    if not safe_call and U and U.safe_call then safe_call = U.safe_call end
+    if not safe_call_err and U and U.safe_call_err then safe_call_err = U.safe_call_err end
+    if not find_all and U and U.find_all then find_all = U.find_all end
+    if not find_first and U and U.find_first then find_first = U.find_first end
+    if not split_ws and U and U.split_ws then split_ws = U.split_ws end
+    if not get_local_controller and U and U.get_local_controller then get_local_controller = U.get_local_controller end
+    if not get_local_pawn and U and U.get_local_pawn then get_local_pawn = U.get_local_pawn end
+    if not get_current_map and U and U.get_current_map then get_current_map = U.get_current_map end
     if UEH == nil then
         local ok, mod = pcall(require, "UEHelpers")
         if ok then UEH = mod else UEH = false end
@@ -1533,7 +2274,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             print("[getmap] Teleport module not loaded.")
             return true
         end
-        print("[Map] Current map:", TP.get_current_map())
+        print("[Map] Current map:", get_current_map())
         return true
     end, "prints current detected map", "Debug")
 
@@ -1542,17 +2283,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             print("[getpos] Teleport module not loaded.")
             return true
         end
-        local pawn = nil
-        if TP and TP.get_local_pawn then
-            pawn = TP.get_local_pawn()
-        else
-            local pc = nil
-            if _G.UE and UE.GetLocalPlayerController then
-                local ok, v = pcall(UE.GetLocalPlayerController)
-                if ok then pc = v end
-            end
-            if pc and pc.K2_GetPawn then pawn = pc:K2_GetPawn() end
-        end
+        local pawn = get_local_pawn and get_local_pawn() or nil
         if not pawn or not pawn.K2_GetActorLocation then
             print("[getpos] No pawn.")
             return true
@@ -1583,9 +2314,31 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local state = set_hook_prints(enable)
+        notify_ok("Hook prints: " .. (state and "ON" or "OFF"))
         print("[hookprints] " .. (state and "ON" or "OFF"))
         return true
     end, "hookprints <on|off|toggle> -> log when hooks fire", "Debug")
+
+    reg("dumpfn", function(args)
+        local name = args and args[1]
+        if not name or name == "" then
+            print("usage: dumpfn <FunctionNameOrPath>")
+            return true
+        end
+        if not _G.StaticFindObject then
+            print("StaticFindObject missing")
+            return true
+        end
+        local lookup = name
+        if lookup:sub(1,9) ~= "Function " then lookup = "Function " .. lookup end
+        local ok, fn = pcall(_G.StaticFindObject, lookup)
+        if not ok or not fn then
+            print("Function not found:", lookup)
+            return true
+        end
+        _G.dump_ufunction_safe(fn)
+        return true
+    end, "safe ufunction dump (no param traversal)", "Dev")
 
     -- 3) teleport core
     reg("tp", function(args)
@@ -1600,6 +2353,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         end
         local spec = tostring(args[1])
         local ok, msg = TP.teleport(spec)
+        if ok then
+            notify_ok("Teleported to: " .. tostring(spec))
+        else
+            notify_err("Teleport Failed: " .. tostring(msg))
+        end
         print(ok and ("[tp] OK -> " .. tostring(spec)) or ("[tp] FAIL -> " .. tostring(msg)))
         return true
     end, "tp <key> | tp LOBBY:key | tp MAIN:key", "Teleport")
@@ -1656,26 +2414,57 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         return true
     end, "lists all players with position and HP", "Players")
 
+    reg("ueplayers", function(args)
+        if not UEH then
+            print("[ueplayers] UEHelpers not loaded.")
+            return true
+        end
+        if not UEH.GetAllPlayerStates or not UEH.GetAllPlayers then
+            print("[ueplayers] UEHelpers missing GetAllPlayerStates/GetAllPlayers.")
+            return true
+        end
+
+        local function print_list(label, list)
+            if type(list) ~= "table" then
+                print(string.format("[%s] None", label))
+                return
+            end
+            print(string.format("=== %s (%d) ===", label, #list))
+            for i, obj in ipairs(list) do
+                local name = get_actor_name(obj)
+                local full = ""
+                if obj and obj.GetFullName then
+                    local ok, v = pcall(obj.GetFullName, obj)
+                    if ok and v then full = tostring(v) end
+                end
+                if full ~= "" and full ~= name then
+                    print(string.format("%d) %s | %s", i, name, full))
+                else
+                    print(string.format("%d) %s", i, name))
+                end
+            end
+        end
+
+        local ok_ps, player_states = pcall(UEH.GetAllPlayerStates)
+        if not ok_ps then
+            print("[ueplayers] GetAllPlayerStates failed.")
+        else
+            print_list("PlayerStates", player_states)
+        end
+
+        local ok_players, players = pcall(UEH.GetAllPlayers)
+        if not ok_players then
+            print("[ueplayers] GetAllPlayers failed.")
+        else
+            print_list("Players", players)
+        end
+        return true
+    end, "prints UEHelpers.GetAllPlayerStates and GetAllPlayers", "Players")
+
     reg("listplayers_gui", function(args)
         local entries, order = get_all_player_entries()
-        local self_pawn = TP and TP.get_local_pawn and TP.get_local_pawn() or nil
-        local self_pc = nil
-        if UEH and UEH.GetPlayerController then
-            local pc = UEH.GetPlayerController()
-            if pc and pc.IsValid and pc:IsValid() then
-                self_pc = pc
-            end
-        end
-        if not self_pc and _G.UE and UE.GetLocalPlayerController then
-            local ok, v = pcall(UE.GetLocalPlayerController)
-            if ok then self_pc = v end
-        end
-        if UEH and UEH.GetPlayer then
-            local pawn = UEH.GetPlayer()
-            if pawn and pawn.IsValid and pawn:IsValid() then
-                self_pawn = pawn
-            end
-        end
+        local self_pawn = get_local_pawn and get_local_pawn() or nil
+        local self_pc = get_local_controller and get_local_controller() or nil
         local self_ps = self_pc and get_player_state_from_pc(self_pc) or nil
         local self_keys = {}
         local function add_self_key(obj)
@@ -1767,11 +2556,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
 
         if not self_name or self_name == "" then
             -- Try full chain: local PC -> player state -> resolved name.
-            local pc = self_pc
-            if not pc and _G.UE and UE.GetLocalPlayerController then
-                local ok, v = pcall(UE.GetLocalPlayerController)
-                if ok then pc = v end
-            end
+            local pc = self_pc or (get_local_controller and get_local_controller()) or nil
             if pc and is_valid(pc) then
                 local ps = get_player_state_from_pc(pc)
                 if is_valid(ps) then
@@ -1818,6 +2603,30 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         return true, payload
     end, "GUI: returns player list string", "Players")
 
+    reg("weapon_gui_state", function(args)
+        local pawn, who = parse_target_args(args or {})
+        local target_name = sanitize_state_token(who or "self")
+        if not pawn then
+            return true, "WEAPONSTATE=TARGET:" .. target_name .. "#OK:0"
+        end
+        local weapon = get_player_weapon(pawn)
+        if not weapon then
+            return true, "WEAPONSTATE=TARGET:" .. target_name .. "#OK:0"
+        end
+        local meta = weapon_meta_from_obj(weapon) or {}
+        local name = meta.name or get_actor_name(weapon)
+        local code = meta.code or ""
+        local cls = meta.class or ""
+        local payload = string.format(
+            "WEAPONSTATE=TARGET:%s#OK:1#NAME:%s#CODE:%s#CLASS:%s",
+            target_name,
+            sanitize_state_token(name),
+            sanitize_state_token(code),
+            sanitize_state_token(cls)
+        )
+        return true, payload
+    end, "GUI: returns current weapon for target player", "Weapons")
+
     reg("world_registry_scan", function(args)
         if R and R.full_rescan then
             R.full_rescan()
@@ -1825,6 +2634,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
                 R.request_emit(true)
             end
         end
+        notify_ok("World registry scan requested.")
         return true, "OK"
     end, "GUI: rescan world registry (pushes bridge update)", "World")
 
@@ -1842,12 +2652,41 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         return true, "WORLD="
     end, "GUI: returns world registry list (use 'scan' to rescan)", "World")
 
+    reg("state_snapshot", function(args)
+        notify_ok("State snapshot requested.")
+        return true, "OK"
+    end, "GUI: forces state snapshot emit", "Debug")
+
+    reg("registry_clear", function(args)
+        if R and R.clear then
+            R.clear()
+            if R.request_emit then
+                R.request_emit(true)
+            end
+        end
+        notify_ok("Registry cleared.")
+        return true, "OK"
+    end, "GUI: clears world registry", "Debug")
+
+    reg("registry_rebuild", function(args)
+        if R and R.rebuild then
+            R.rebuild()
+            if R.request_emit then
+                R.request_emit(true)
+            end
+        end
+        notify_ok("Registry rebuild started.")
+        return true, "OK"
+    end, "GUI: clears and rescans world registry", "Debug")
+
     reg("world_tp", function(args)
         if not R or not R.get_entry_by_id then
+            notify_err("Teleport Failed: registry not loaded.")
             print("[world_tp] Registry not loaded.")
             return true
         end
         if not TP or not TP.teleport_to_location then
+            notify_err("Teleport Failed: module not loaded.")
             print("[world_tp] Teleport module not loaded.")
             return true
         end
@@ -1858,6 +2697,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         local id = tostring(args[1] or "")
         local entry = R.get_entry_by_id(id)
         if not entry or not entry.obj or not is_valid(entry.obj) then
+            notify_warn("Teleport Failed: object not found.")
             print("[world_tp] Object not found.")
             return true
         end
@@ -1868,6 +2708,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             end
         end
         if not loc then
+            notify_err("Teleport Failed: no object location.")
             print("[world_tp] No object location.")
             return true
         end
@@ -1875,16 +2716,24 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             TP.save_local_return()
         end
         local ok, msg = TP.teleport_to_location({ x = loc.X or 0, y = loc.Y or 0, z = loc.Z or 0 })
+        if ok then
+            local name = entry.name or entry.class or "Object"
+            notify_ok("Teleported to: " .. tostring(name))
+        else
+            notify_err("Teleport Failed: " .. tostring(msg))
+        end
         print(ok and "[world_tp] OK" or ("[world_tp] FAIL -> " .. tostring(msg)))
         return true
     end, "world_tp <id> -> teleport to registry object", "World")
 
     reg("world_bring", function(args)
         if not R or not R.get_entry_by_id then
+            notify_err("Bring failed: registry not loaded.")
             print("[world_bring] Registry not loaded.")
             return true
         end
         if not TP or not TP.teleport_to_location then
+            notify_err("Bring failed: module not loaded.")
             print("[world_bring] Teleport module not loaded.")
             return true
         end
@@ -1895,26 +2744,36 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         local id = tostring(args[1] or "")
         local entry = R.get_entry_by_id(id)
         if not entry or not entry.obj or not is_valid(entry.obj) then
+            notify_warn("Bring failed: object not found.")
             print("[world_bring] Object not found.")
             return true
         end
-        local pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+        local pawn = get_local_pawn and get_local_pawn() or nil
         if not pawn then
+            notify_err("Bring failed: no local pawn.")
             print("[world_bring] No local pawn.")
             return true
         end
         local loc = get_actor_location(pawn)
         if not loc then
+            notify_err("Bring failed: no local location.")
             print("[world_bring] No local location.")
             return true
         end
         local ok, msg = TP.teleport_to_location({ x = loc.X or 0, y = loc.Y or 0, z = loc.Z or 0 }, entry.obj, false)
+        if ok then
+            local name = entry.name or entry.class or "Object"
+            notify_ok("Brought to you: " .. tostring(name))
+        else
+            notify_err("Bring failed: " .. tostring(msg))
+        end
         print(ok and "[world_bring] OK" or ("[world_bring] FAIL -> " .. tostring(msg)))
         return true
     end, "world_bring <id> -> bring registry object to you", "World")
 
     reg("gotoplayer", function(args)
         if not TP or not TP.teleport_to_location then
+            notify_err("Teleport Failed: module not loaded.")
             print("[gotoplayer] Teleport module not loaded.")
             return true
         end
@@ -1925,25 +2784,34 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         local query = table.concat(args, " ")
         local entry = find_player_by_name(query)
         if not entry then
+            notify_warn("Teleport Failed: player not found.")
             print("[gotoplayer] Player not found:", query)
             return true
         end
         if not entry.pawn then
+            notify_err("Teleport Failed: no pawn for player.")
             print("[gotoplayer] No pawn for player:", entry.name)
             return true
         end
         local loc = get_actor_location(entry.pawn)
         if not loc then
+            notify_err("Teleport Failed: no player location.")
             print("[gotoplayer] No location for player:", entry.name)
             return true
         end
         local ok, msg = TP.teleport_to_location({ x = loc.X, y = loc.Y, z = loc.Z })
+        if ok then
+            notify_ok("Teleported to player: " .. tostring(entry.name))
+        else
+            notify_err("Teleport Failed: " .. tostring(msg))
+        end
         print(ok and ("[gotoplayer] OK -> " .. tostring(entry.name)) or ("[gotoplayer] FAIL -> " .. tostring(msg)))
         return true
     end, "gotoplayer <name> -> teleports you to that player", "Players")
 
     reg("bringplayer", function(args)
         if not TP or not TP.teleport_to_location then
+            notify_err("Bring failed: module not loaded.")
             print("[bringplayer] Teleport module not loaded.")
             return true
         end
@@ -1954,20 +2822,24 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         local query = table.concat(args, " ")
         local entry = find_player_by_name(query)
         if not entry then
+            notify_warn("Bring failed: player not found.")
             print("[bringplayer] Player not found:", query)
             return true
         end
         if not entry.pawn then
+            notify_err("Bring failed: no pawn for player.")
             print("[bringplayer] No pawn for player:", entry.name)
             return true
         end
-        local self_pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+        local self_pawn = get_local_pawn and get_local_pawn() or nil
         if not self_pawn then
+            notify_err("Bring failed: no local pawn.")
             print("[bringplayer] No local pawn.")
             return true
         end
         local loc = get_actor_location(self_pawn)
         if not loc then
+            notify_err("Bring failed: no local location.")
             print("[bringplayer] No local location.")
             return true
         end
@@ -1975,12 +2847,18 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             TP.save_local_return()
         end
         local ok, msg = TP.teleport_to_location({ x = loc.X, y = loc.Y, z = loc.Z }, entry.pawn, false)
+        if ok then
+            notify_ok("Brought player: " .. tostring(entry.name))
+        else
+            notify_err("Bring failed: " .. tostring(msg))
+        end
         print(ok and ("[bringplayer] OK -> " .. tostring(entry.name)) or ("[bringplayer] FAIL -> " .. tostring(msg)))
         return true
     end, "bringplayer <name> -> teleports that player to you", "Players")
 
     reg("tpplayerto", function(args)
         if not TP or not TP.teleport or not TP.teleport_to_location then
+            notify_err("Teleport Failed: module not loaded.")
             print("[tpplayerto] Teleport module not loaded.")
             return true
         end
@@ -1992,15 +2870,18 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         local dest_spec = decode_arg(table.concat(args, " ", 2))
         local entry = find_player_by_name(target_query)
         if not entry then
+            notify_warn("Teleport Failed: player not found.")
             print("[tpplayerto] Player not found:", target_query)
             return true
         end
         if not entry.pawn then
+            notify_err("Teleport Failed: no pawn for player.")
             print("[tpplayerto] No pawn for player:", entry.name)
             return true
         end
         local kind, value = dest_spec:match("^%s*(%a+)%s*:%s*(.+)$")
         if not kind or not value then
+            notify_warn("Teleport Failed: bad destination.")
             print("[tpplayerto] Bad destination:", dest_spec)
             return true
         end
@@ -2013,6 +2894,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
 
         if kind == "TP" then
             local ok, msg = TP.teleport(value, entry.pawn, false)
+            if ok then
+                notify_ok("Teleported " .. tostring(entry.name) .. " to: " .. tostring(value))
+            else
+                notify_err("Teleport Failed: " .. tostring(msg))
+            end
             print(ok and ("[tpplayerto] OK -> " .. tostring(entry.name)) or ("[tpplayerto] FAIL -> " .. tostring(msg)))
             return true
         end
@@ -2020,15 +2906,18 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         if kind == "P" or kind == "PLAYER" then
             local dest_entry = find_player_by_name(value)
             if not dest_entry then
+                notify_warn("Teleport Failed: destination player not found.")
                 print("[tpplayerto] Destination player not found:", value)
                 return true
             end
             if not dest_entry.pawn then
+                notify_err("Teleport Failed: no pawn for destination.")
                 print("[tpplayerto] No pawn for destination:", dest_entry.name)
                 return true
             end
             local loc = get_actor_location(dest_entry.pawn)
             if not loc then
+                notify_err("Teleport Failed: no destination location.")
                 print("[tpplayerto] No location for destination:", dest_entry.name)
                 return true
             end
@@ -2038,10 +2927,16 @@ function Commands.init(Util, Pointers, Teleport, Registry)
                 rot = rot and { pitch = rot.Pitch or 0, yaw = rot.Yaw or 0, roll = rot.Roll or 0 } or nil,
             }
             local ok, msg = TP.teleport_to_location(pos, entry.pawn, false)
+            if ok then
+                notify_ok("Teleported " .. tostring(entry.name) .. " to player: " .. tostring(dest_entry.name))
+            else
+                notify_err("Teleport Failed: " .. tostring(msg))
+            end
             print(ok and ("[tpplayerto] OK -> " .. tostring(entry.name)) or ("[tpplayerto] FAIL -> " .. tostring(msg)))
             return true
         end
 
+        notify_warn("Teleport Failed: unsupported destination.")
         print("[tpplayerto] Unsupported destination:", dest_spec)
         return true
     end, "tpplayerto <player> <TP:key | P:name> -> teleports player to destination", "Teleport")
@@ -2080,6 +2975,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local ok, msg = TP.set_return_point()
+        if ok then
+            notify_ok("Return point saved.")
+        else
+            notify_err("Return point failed: " .. tostring(msg))
+        end
         print(ok and "[tpsetreturn] Saved." or ("[tpsetreturn] " .. tostring(msg)))
         return true
     end, "tpsetreturn -> save return point", "Teleport")
@@ -2090,6 +2990,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local ok, msg = TP.return_self()
+        if ok then
+            notify_ok("Returned to saved point.")
+        else
+            notify_err("Return failed: " .. tostring(msg))
+        end
         print(ok and "[tpreturn] Returned." or ("[tpreturn] " .. tostring(msg)))
         return true
     end, "tpreturn -> return to saved point", "Teleport")
@@ -2104,12 +3009,18 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local key = tostring(args[1])
-        local map = TP.get_current_map and TP.get_current_map() or "Unknown"
+        local map = get_current_map and get_current_map() or "Unknown"
         if map == "Unknown" then
+            notify_warn("Teleport Failed: map unknown.")
             print("[tpmap] Map unknown.")
             return true
         end
         local ok, msg = TP.teleport(key)
+        if ok then
+            notify_ok("Teleported to: " .. tostring(key))
+        else
+            notify_err("Teleport Failed: " .. tostring(msg))
+        end
         print(ok and ("[tpmap] OK -> " .. key) or ("[tpmap] FAIL -> " .. tostring(msg)))
         return true
     end, "tpmap <key> -> teleport to map location", "Teleport")
@@ -2124,8 +3035,9 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local key = tostring(args[1])
-        local map = TP.get_current_map and TP.get_current_map() or "Unknown"
+        local map = get_current_map and get_current_map() or "Unknown"
         if map == "Unknown" then
+            notify_warn("Teleport Failed: map unknown.")
             print("[tpallmap] Map unknown.")
             return true
         end
@@ -2134,6 +3046,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         end
         local pawns = TP.get_all_player_pawns and TP.get_all_player_pawns() or nil
         if not pawns or #pawns == 0 then
+            notify_warn("Teleport Failed: no players found.")
             print("[tpallmap] No players found.")
             return true
         end
@@ -2144,22 +3057,26 @@ function Commands.init(Util, Pointers, Teleport, Registry)
                 if ok then count = count + 1 end
             end
         end
+        notify_ok("Teleported all players to: " .. tostring(key) .. " (" .. tostring(count) .. ")")
         print("[tpallmap] Teleported:", count)
         return true
     end, "tpallmap <key> -> teleport all players to map location", "Teleport")
 
     reg("bringallplayers", function(args)
-        if not TP or not TP.get_local_pawn or not TP.teleport_to_location then
+        if not TP or not get_local_pawn or not TP.teleport_to_location then
+            notify_err("Bring failed: teleport module not loaded.")
             print("[bringallplayers] Teleport module not loaded.")
             return true
         end
-        local pawn = TP.get_local_pawn()
+        local pawn = get_local_pawn()
         if not pawn then
+            notify_err("Bring failed: no local pawn.")
             print("[bringallplayers] No local pawn.")
             return true
         end
         local loc = get_actor_location(pawn)
         if not loc then
+            notify_err("Bring failed: no local location.")
             print("[bringallplayers] No local location.")
             return true
         end
@@ -2168,6 +3085,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         end
         local pawns = TP.get_all_player_pawns and TP.get_all_player_pawns() or nil
         if not pawns or #pawns == 0 then
+            notify_warn("Bring failed: no players found.")
             print("[bringallplayers] No players found.")
             return true
         end
@@ -2178,12 +3096,14 @@ function Commands.init(Util, Pointers, Teleport, Registry)
                 if ok then count = count + 1 end
             end
         end
+        notify_ok("Brought players: " .. tostring(count))
         print("[bringallplayers] Brought:", count)
         return true
     end, "bringallplayers -> bring all players to you", "Teleport")
 
     reg("tpnearest", function(args)
         if not TP then
+            notify_err("Teleport Failed: module not loaded.")
             print("[tpnearest] Teleport module not loaded.")
             return true
         end
@@ -2191,33 +3111,43 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             print("[tpnearest] Usage: tpnearest <type>")
             return true
         end
-        local pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+        local pawn = get_local_pawn and get_local_pawn() or nil
         if not pawn then
+            notify_err("Teleport Failed: no local pawn.")
             print("[tpnearest] No local pawn.")
             return true
         end
         local origin = get_actor_location(pawn)
         if not origin then
+            notify_err("Teleport Failed: no local location.")
             print("[tpnearest] No local location.")
             return true
         end
         local obj = nearest_by_type(args[1], origin)
         if not obj then
+            notify_warn("Teleport Failed: none found.")
             print("[tpnearest] None found.")
             return true
         end
         local loc = get_actor_location(obj)
         if not loc then
+            notify_err("Teleport Failed: no object location.")
             print("[tpnearest] No object location.")
             return true
         end
         local ok, msg = TP.teleport_to_location({ x = loc.X, y = loc.Y, z = loc.Z })
+        if ok then
+            notify_ok("Teleported to nearest: " .. tostring(args[1]))
+        else
+            notify_err("Teleport Failed: " .. tostring(msg))
+        end
         print(ok and "[tpnearest] OK" or ("[tpnearest] FAIL -> " .. tostring(msg)))
         return true
     end, "tpnearest <type> -> teleport to nearest object", "Teleport")
 
     reg("bringnearest", function(args)
         if not TP then
+            notify_err("Bring failed: module not loaded.")
             print("[bringnearest] Teleport module not loaded.")
             return true
         end
@@ -2225,18 +3155,21 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             print("[bringnearest] Usage: bringnearest <type>")
             return true
         end
-        local pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+        local pawn = get_local_pawn and get_local_pawn() or nil
         if not pawn then
+            notify_err("Bring failed: no local pawn.")
             print("[bringnearest] No local pawn.")
             return true
         end
         local origin = get_actor_location(pawn)
         if not origin then
+            notify_err("Bring failed: no local location.")
             print("[bringnearest] No local location.")
             return true
         end
         local obj = nearest_by_type(args[1], origin)
         if not obj then
+            notify_warn("Bring failed: none found.")
             print("[bringnearest] None found.")
             return true
         end
@@ -2244,6 +3177,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             TP.save_local_return()
         end
         local ok, msg = TP.teleport_to_location({ x = origin.X, y = origin.Y, z = origin.Z }, obj, false)
+        if ok then
+            notify_ok("Brought nearest: " .. tostring(args[1]))
+        else
+            notify_err("Bring failed: " .. tostring(msg))
+        end
         print(ok and "[bringnearest] OK" or ("[bringnearest] FAIL -> " .. tostring(msg)))
         return true
     end, "bringnearest <type> -> bring nearest object to you", "Teleport")
@@ -2252,8 +3190,8 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         if not TP then
             return true, "TPSTATE=MAP:Unknown#PAWN:0#RETURN:0#TPS:#NEAR:#OTHERS:0"
         end
-        local map = TP.get_current_map and TP.get_current_map() or "Unknown"
-        local pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+        local map = get_current_map and get_current_map() or "Unknown"
+        local pawn = get_local_pawn and get_local_pawn() or nil
         local pawn_ok = pawn ~= nil
         local return_ok = false
         if pawn_ok and TP.get_return_position then
@@ -2296,7 +3234,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         local entries, order = get_all_player_entries()
         local others = 0
         if order and #order > 0 then
-            local self_pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+            local self_pawn = get_local_pawn and get_local_pawn() or nil
             for _, key in ipairs(order) do
                 local e = entries[key]
                 local is_self = (self_pawn and e.pawn and e.pawn == self_pawn)
@@ -2341,18 +3279,49 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         return true
     end, "lists saved return positions", "Teleport")
 
+    local function interact_contract_terminal(pawn)
+        if not is_valid(pawn) then
+            return false, "Local player not found."
+        end
+        local origin = get_actor_location(pawn)
+        local classes = { "BP_ContractManagerTerminal_C" }
+        local term = find_nearest_actor(classes, origin)
+        if not is_valid(term) then
+            return false, "Contract terminal not found."
+        end
+        local fn_name = "/Game/Blueprints/Screens/Terminals/BP_TerminalBasic.BP_TerminalBasic_C:BPI_Interactable_Input"
+        local ufn = resolve_ufunction(fn_name)
+        local last_err = nil
+        if ufn and is_ufunction(ufn) then
+            local ok_cf, cf_err = call_ufunction_on(term, ufn, pawn)
+            if ok_cf then
+                return true, "ok"
+            end
+            last_err = cf_err
+        end
+        local ok, _, err = safe_call_err(term, "BPI_Interactable_Input", pawn)
+        if ok then
+            return true, "ok"
+        end
+        return false, tostring(err or last_err or "failed")
+    end
+
     reg("opencontracts", function(args)
-        if not TP then
-            print("[opencontracts] Teleport module not loaded.")
+        if not TP or not get_local_pawn then
+            print("[OpenContracts] Teleport module not loaded.")
             return true
         end
-        if TP.get_current_map and TP.get_current_map() ~= "Lobby" then
-            print("[OpenContracts] Only available in Lobby.")
-            return true
+        if TP.teleport then
+            local ok_tp, msg = TP.teleport("LOBBY:contracts")
+            if not ok_tp then
+                print("[OpenContracts] Teleport failed: " .. tostring(msg))
+                return true
+            end
         end
-        local ok, msg = TP.teleport("LOBBY:contracts")
-        if not ok then
-            print("[OpenContracts] " .. tostring(msg))
+        local pawn = get_local_pawn()
+        local ok_int, msg_int = interact_contract_terminal(pawn)
+        if not ok_int then
+            print("[OpenContracts] " .. tostring(msg_int))
             return true
         end
         open_contracts_active = true
@@ -2363,20 +3332,26 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             print("[OpenContracts] Use returnself to return.")
         end
         return true
-    end, "teleports to contracts in Lobby (ESC to return)", "Contracts")
+    end, "opens contract terminal for local player (ESC to return)", "Contracts")
 
     reg("startcontract", function(args)
         if not TP then
             print("[startcontract] Teleport module not loaded.")
             return true
         end
-        if TP.get_current_map and TP.get_current_map() ~= "Lobby" then
+        if get_current_map and get_current_map() ~= "Lobby" then
             print("[StartContract] Only available in Lobby.")
             return true
         end
         local ok, msg = TP.teleport("LOBBY:contracts")
         if not ok then
             print("[StartContract] " .. tostring(msg))
+            return true
+        end
+        local pawn = get_local_pawn and get_local_pawn() or nil
+        local ok_int, msg_int = interact_contract_terminal(pawn)
+        if not ok_int then
+            print("[StartContract] " .. tostring(msg_int))
             return true
         end
         start_contract_active = true
@@ -2387,20 +3362,192 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             print("[StartContract] Use tp LOBBY:ship to go to ship.")
         end
         return true
-    end, "teleports to contracts in Lobby (ESC -> ship)", "Contracts")
+    end, "teleports to contracts in Lobby and interacts (ESC -> ship)", "Contracts")
+
+    reg("setcontract", function(args)
+        args = args or {}
+        local bb = _G.BlackboxRecode or {}
+        local lists = {}
+        if type(bb.ContractLists) == "table" then
+            for _, arr in pairs(bb.ContractLists) do
+                if arr ~= nil then
+                    lists[#lists + 1] = arr
+                end
+            end
+        elseif bb.ContractList then
+            lists[#lists + 1] = bb.ContractList
+        end
+        local first = lists[1] and get_first_contract_struct(lists[1]) or nil
+        local types = first and build_contract_prop_types(first) or {}
+
+        if #args == 0 or tostring(args[1]):lower() == "help" then
+            print_setcontract_help(types)
+            return true
+        end
+        if #lists == 0 then
+            print("[setcontract] No contract list cached. Open the contract terminal first.")
+            print_setcontract_help(types)
+            return true
+        end
+        if not first then
+            print("[setcontract] Could not read first contract struct.")
+            print_setcontract_help(types)
+            return true
+        end
+        if #args < #CONTRACT_PROP_ORDER then
+            print(string.format("[setcontract] Expected %d values, got %d.", #CONTRACT_PROP_ORDER, #args))
+            print_setcontract_help(types)
+            return true
+        end
+
+        local values = {}
+        for i = 1, #CONTRACT_PROP_ORDER do
+            local name = CONTRACT_PROP_ORDER[i]
+            local raw = args[i]
+            if raw == nil then
+                print(string.format("[setcontract] Missing value for %s", name))
+                return true
+            end
+            local ptype = tostring(types[name] or "")
+            local val = raw
+            if ptype:find("BoolProperty", 1, true) then
+                local b = parse_bool(raw)
+                if b == nil then
+                    print(string.format("[setcontract] Invalid bool for %s: %s", name, tostring(raw)))
+                    return true
+                end
+                val = b
+            elseif ptype:find("ByteProperty", 1, true) or ptype:find("IntProperty", 1, true) then
+                local n = tonumber(raw)
+                if n == nil then
+                    print(string.format("[setcontract] Invalid number for %s: %s", name, tostring(raw)))
+                    return true
+                end
+                val = math.floor(n)
+            else
+                local b = parse_bool(raw)
+                if b ~= nil then
+                    val = b
+                else
+                    local n = tonumber(raw)
+                    if n ~= nil then
+                        val = math.floor(n)
+                    end
+                end
+            end
+            values[name] = val
+        end
+
+        local function contract_field_match(values_table, needle)
+            local needle_l = tostring(needle or ""):lower()
+            for k, v in pairs(values_table or {}) do
+                if tostring(k):lower():find(needle_l, 1, true) then
+                    return v
+                end
+            end
+            return nil
+        end
+
+        local updated = 0
+        local seen = {}
+        for _, arr in ipairs(lists) do
+            local key = tostring(arr)
+            if not seen[key] then
+                seen[key] = true
+                updated = updated + apply_contract_list_first(arr, values)
+            end
+        end
+        if updated <= 0 then
+            notify_warn("Contract Set: no contracts updated.")
+            print("[setcontract] No contracts updated.")
+        else
+            local info = {}
+            local ctype = contract_field_match(values, "contracttype")
+            local diff = contract_field_match(values, "difficulty")
+            local mapv = contract_field_match(values, "map")
+            if ctype ~= nil then info[#info + 1] = "Type=" .. tostring(ctype) end
+            if diff ~= nil then info[#info + 1] = "Diff=" .. tostring(diff) end
+            if mapv ~= nil then info[#info + 1] = "Map=" .. tostring(mapv) end
+            local suffix = (#info > 0) and (" (" .. table.concat(info, " ") .. ")") or ""
+            notify_ok("Contract Set: updated " .. tostring(updated) .. " list(s)" .. suffix, 3200)
+            print(string.format("[setcontract] Updated %d list(s).", updated))
+        end
+        return true
+    end, "setcontract <values...> -> overwrite first contract in each list screen (use 'setcontract help')", "Contracts")
+
+    reg("contract_gui_state", function(args)
+        local lists = get_contract_lists()
+        local first = lists[1] and get_first_contract_struct(lists[1]) or nil
+        local types = first and build_contract_prop_types(first) or {}
+        local values = first and build_contract_values(first) or {}
+        local bb = _G.BlackboxRecode or {}
+        local now = (U and U.now_time and U.now_time()) or os.clock()
+        local last = tonumber(bb.LastContractListTime or 0) or 0
+        local age = (last > 0) and math.max(0, now - last) or -1
+        local map_name = (get_current_map and get_current_map()) or "Unknown"
+        local payload = {
+            "READY:" .. ((#lists > 0 and first) and "1" or "0"),
+            "MAP:" .. tostring(map_name),
+            "LISTS:" .. tostring(#lists),
+            "FIRST:" .. (first and "1" or "0"),
+            "PROPS:" .. tostring(#CONTRACT_PROP_ORDER),
+            "HOOKS:" .. tostring(bb.ContractListCount or 0),
+            "AGE:" .. string.format("%.3f", age),
+            "VALUES:" .. encode_contract_pairs(values, CONTRACT_PROP_ORDER, false),
+            "TYPES:" .. encode_contract_pairs(types, CONTRACT_PROP_ORDER, false),
+        }
+        return true, "CONTRACTS=" .. table.concat(payload, "#")
+    end, "GUI: returns contract state string", "Contracts")
+
+    reg("activatepower", function(args)
+        local gs = find_first("BP_MyGameState_C")
+        if not is_valid(gs) then
+            print("[Power] Could not find BP_MyGameState_C (are you fully in-game?)")
+            return true
+        end
+        local ok, err = _call_change_light(gs, 0, true)
+        if not ok then
+            print("[Power] Call failed: " .. tostring(err or "unknown"))
+        else
+            print("[Power] Activated.")
+        end
+        return true
+    end, "turns power ON", "Power")
+
+    reg("deactivatepower", function(args)
+        local gs = find_first("BP_MyGameState_C")
+        if not is_valid(gs) then
+            print("[Power] Could not find BP_MyGameState_C (are you fully in-game?)")
+            return true
+        end
+        local ok, err = _call_change_light(gs, 1, false)
+        if not ok then
+            print("[Power] Call failed: " .. tostring(err or "unknown"))
+        else
+            print("[Power] Deactivated.")
+        end
+        return true
+    end, "turns power OFF", "Power")
 
     reg("heal", function(args)
         local pawn, who = parse_target_args(args or {})
         if not pawn then
+            notify_err("Heal failed: no pawn for target.")
             print("[heal] No pawn for target:", tostring(who))
             return true
         end
         local max_hp = get_number_prop(pawn, "MaxHealth")
         if not max_hp then
+            notify_err("Heal failed: no MaxHealth.")
             print("[heal] No MaxHealth on target:", tostring(who))
             return true
         end
         local ok = set_prop(pawn, "Health", max_hp)
+        if ok then
+            notify_ok("Healed: " .. tostring(who))
+        else
+            notify_err("Heal failed: " .. tostring(who))
+        end
         print(ok and ("[heal] OK -> " .. tostring(who)) or ("[heal] Failed -> " .. tostring(who)))
         return true
     end, "heal [target] -> sets Health to MaxHealth", "Player")
@@ -2408,6 +3555,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
     reg("god", function(args)
         local pawn, who, rest = parse_target_args(args or {})
         if not pawn then
+            notify_err("Godmode failed: no pawn for target.")
             print("[god] No pawn for target:", tostring(who))
             return true
         end
@@ -2421,6 +3569,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local ok = set_prop(pawn, "bCanBeDamaged", not enable)
+        if ok then
+            notify_ok("Godmode " .. (enable and "ON" or "OFF") .. ": " .. tostring(who))
+        else
+            notify_err("Godmode failed: " .. tostring(who))
+        end
         print(ok and ("[god] OK -> " .. tostring(who)) or ("[god] Failed -> " .. tostring(who)))
         return true
     end, "god <on|off> [target] -> toggle invulnerability", "Player")
@@ -2428,6 +3581,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
     reg("stamina", function(args)
         local pawn, who, rest = parse_target_args(args or {})
         if not pawn then
+            notify_err("Stamina failed: no pawn for target.")
             print("[stamina] No pawn for target:", tostring(who))
             return true
         end
@@ -2441,6 +3595,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local ok = set_prop(pawn, "UnlimitedStamina", enable)
+        if ok then
+            notify_ok("Stamina " .. (enable and "ON" or "OFF") .. ": " .. tostring(who))
+        else
+            notify_err("Stamina failed: " .. tostring(who))
+        end
         print(ok and ("[stamina] OK -> " .. tostring(who)) or ("[stamina] Failed -> " .. tostring(who)))
         return true
     end, "stamina <on|off> [target] -> unlimited stamina", "Player")
@@ -2448,6 +3607,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
     reg("battery", function(args)
         local pawn, who, rest = parse_target_args(args or {})
         if not pawn then
+            notify_err("Battery failed: no pawn for target.")
             print("[battery] No pawn for target:", tostring(who))
             return true
         end
@@ -2461,6 +3621,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local ok = set_prop(pawn, "UnlimitedFlashlight", enable)
+        if ok then
+            notify_ok("Battery " .. (enable and "ON" or "OFF") .. ": " .. tostring(who))
+        else
+            notify_err("Battery failed: " .. tostring(who))
+        end
         print(ok and ("[battery] OK -> " .. tostring(who)) or ("[battery] Failed -> " .. tostring(who)))
         return true
     end, "battery <on|off> [target] -> unlimited flashlight", "Player")
@@ -2468,6 +3633,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
     reg("walkspeed", function(args)
         local pawn, who, rest = parse_target_args(args or {})
         if not pawn then
+            notify_err("Walkspeed failed: no pawn for target.")
             print("[walkspeed] No pawn for target:", tostring(who))
             return true
         end
@@ -2482,8 +3648,10 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         end
         local ok = set_base_walk_speed(pawn, speed)
         if ok then
+            notify_ok(string.format("Walkspeed %.2f -> %s", speed, tostring(who)))
             print(string.format("[walkspeed] Set BaseWalkSpeed to %.2f for %s", speed, tostring(who)))
         else
+            notify_err("Walkspeed failed: " .. tostring(who))
             print("[walkspeed] Could not find BaseWalkSpeed on target:", tostring(who))
         end
         return true
@@ -2500,6 +3668,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local ok = set_terminal_all_pipes(enable)
+        if ok then
+            notify_ok("Pipes: all " .. (enable and "ON" or "OFF"))
+        else
+            notify_err("Pipes failed: terminal not found.")
+        end
         print(ok and ("[pipeall] OK -> " .. (enable and "on" or "off")) or "[pipeall] Failed (terminal not found?)")
         return true
     end, "pipeall <on|off> -> sets all 16 pipes via terminal", "Pipes")
@@ -2531,12 +3704,18 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local ok = set_terminal_pipe_state(pipe_set, idx, enable)
+        if ok then
+            notify_ok(string.format("Pipe %s %d -> %s", color, idx, enable and "ON" or "OFF"))
+        else
+            notify_err("Pipe set failed: terminal not found.")
+        end
         print(ok and ("[pipeset] OK -> " .. color .. " " .. idx .. " " .. (enable and "on" or "off")) or "[pipeset] Failed (terminal not found?)")
         return true
     end, "pipeset <red|blue> <1-8> <on|off> -> sets one pipe via terminal", "Pipes")
 
     reg("pipegoto", function(args)
         if not TP or not TP.teleport_to_location then
+            notify_err("Teleport Failed: module not loaded.")
             print("[pipegoto] Teleport module not loaded.")
             return true
         end
@@ -2553,11 +3732,13 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         local pipe_set = (color == "red") and 2 or 1
         local obj = find_valve_by_set(pipe_set, idx)
         if not obj then
+            notify_warn("Teleport Failed: valve not found.")
             print("[pipegoto] Valve not found.")
             return true
         end
         local loc = get_actor_location(obj)
         if not loc then
+            notify_err("Teleport Failed: valve location missing.")
             print("[pipegoto] No valve location.")
             return true
         end
@@ -2568,6 +3749,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             y = safe and safe.Y or (loc.Y or 0),
             z = safe and safe.Z or (loc.Z or 0),
         })
+        if ok then
+            notify_ok(string.format("Teleported to pipe %s %d", color, idx))
+        else
+            notify_err("Teleport Failed: " .. tostring(msg))
+        end
         print(ok and "[pipegoto] OK" or ("[pipegoto] FAIL -> " .. tostring(msg)))
         return true
     end, "pipegoto <red|blue> <1-8> -> teleport to valve", "Pipes")
@@ -2666,6 +3852,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         end
         local term = get_lab_terminal()
         if not term then
+            notify_err("Lab airlock failed: terminal not found.")
             print("[labairlockset] Terminal not found.")
             return true
         end
@@ -2677,6 +3864,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         local target = (#args >= 2) and tostring(args[1]) or "all"
         local entries, arrp = get_array_property_structs(term, LAB_STATUT_PROP)
         if not entries or #entries == 0 then
+            notify_err("Lab airlock failed: status not found.")
             print("[labairlockset] Statut not found or empty.")
             return true
         end
@@ -2686,6 +3874,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         if target:lower() ~= "all" then
             target_idx = tonumber(target)
             if not target_idx or target_idx < 1 or target_idx > #entries then
+                notify_warn("Lab airlock failed: invalid index.")
                 print("[labairlockset] Index must be 1-" .. tostring(#entries) .. " or 'all'.")
                 return true
             end
@@ -2728,6 +3917,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             end
         end
 
+        if ok then
+            notify_ok(string.format("Lab airlock: %d set %s", changed, enable and "ON" or "OFF"))
+        else
+            notify_err("Lab airlock failed to write.")
+        end
         print(ok and ("[labairlockset] OK -> " .. tostring(changed)) or "[labairlockset] Failed to write.")
         return true
     end, "labairlockset <on|off> | <1-4|all> <on|off> -> set Valid flag(s)", "Lab")
@@ -2789,7 +3983,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             print("[gotoitem] Unknown item:", tostring(args[1]))
             return true
         end
-        local pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+        local pawn = get_local_pawn and get_local_pawn() or nil
         local origin = pawn and get_actor_location(pawn) or nil
         local obj = find_nearest_actor(classes, origin)
         if not obj then
@@ -2820,7 +4014,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             print("[bringitem] Unknown item:", tostring(args[1]))
             return true
         end
-        local pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+        local pawn = get_local_pawn and get_local_pawn() or nil
         if not pawn then
             print("[bringitem] No local pawn.")
             return true
@@ -2862,7 +4056,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local cls = resolve_weapon_class(args[1])
-        local pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+        local pawn = get_local_pawn and get_local_pawn() or nil
         local origin = pawn and get_actor_location(pawn) or nil
         local obj = find_nearest_actor({ cls }, origin)
         if not obj then
@@ -2889,7 +4083,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local cls = resolve_weapon_class(args[1])
-        local pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+        local pawn = get_local_pawn and get_local_pawn() or nil
         if not pawn then
             print("[bringweapon] No local pawn.")
             return true
@@ -2919,7 +4113,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local cls = resolve_monster_class(args[1])
-        local pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+        local pawn = get_local_pawn and get_local_pawn() or nil
         local origin = pawn and get_actor_location(pawn) or nil
         local obj = find_nearest_actor({ cls }, origin)
         if not obj then
@@ -2946,7 +4140,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local cls = resolve_monster_class(args[1])
-        local pawn = TP.get_local_pawn and TP.get_local_pawn() or nil
+        local pawn = get_local_pawn and get_local_pawn() or nil
         if not pawn then
             print("[bringmonster] No local pawn.")
             return true
@@ -2972,7 +4166,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             print("[listmonsters] No monsters found.")
             return true
         end
-        local pawn = TP and TP.get_local_pawn and TP.get_local_pawn() or nil
+        local pawn = get_local_pawn and get_local_pawn() or nil
         local origin = pawn and get_actor_location(pawn) or nil
         print("=== Monsters ===")
         for i, m in ipairs(monsters) do
@@ -2993,6 +4187,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
     reg("invisible", function(args)
         local pawn, who, rest = parse_target_args(args or {})
         if not pawn then
+            notify_err("Invisible failed: no pawn for target.")
             print("[invisible] No pawn for target:", tostring(who))
             return true
         end
@@ -3009,6 +4204,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         local ok = set_prop(pawn, "CanBeSeen", desired)
         if not ok then
             ok = set_prop(pawn, "bCanBeSeen", desired)
+        end
+        if ok then
+            notify_ok("Invisible " .. (enable and "ON" or "OFF") .. ": " .. tostring(who))
+        else
+            notify_err("Invisible failed: " .. tostring(who))
         end
         print(ok and ("[invisible] " .. (enable and "ON" or "OFF") .. " -> " .. tostring(who))
             or ("[invisible] Failed -> " .. tostring(who)))
@@ -3042,21 +4242,26 @@ function Commands.init(Util, Pointers, Teleport, Registry)
     end, "removemonster [name|all] -> destroys monsters", "Monsters")
 
     reg("setweapondmg", function(args)
-        if not args or #args < 1 then
-            print("[setweapondmg] Usage: setweapondmg <damage>")
+        local pawn, who, rest = parse_target_args(args or {})
+        if not rest or #rest < 1 then
+            print("[setweapondmg] Usage: setweapondmg <damage> [target]")
             return true
         end
-        local dmg = tonumber(args[1])
+        local dmg = tonumber(rest[1])
         if not dmg then
             print("[setweapondmg] Invalid damage.")
             return true
         end
-        local weapon = get_player_weapon()
+        local weapon = get_player_weapon(pawn)
         local targets = {}
+        local target_is_self = tostring(who or ""):lower() == "self"
         if weapon then
             targets[1] = weapon
-        else
+        elseif target_is_self then
             targets = get_all_weapons()
+        else
+            print("[setweapondmg] No weapon found for target:", tostring(who))
+            return true
         end
         if #targets == 0 then
             print("[setweapondmg] No weapons found.")
@@ -3074,24 +4279,29 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         end
         print("[setweapondmg] Updated:", count)
         return true
-    end, "setweapondmg <damage> -> set weapon damage", "Weapons")
+    end, "setweapondmg <damage> [target] -> set weapon damage", "Weapons")
 
     reg("unlimitedammo", function(args)
-        if not args or #args < 1 then
-            print("[unlimitedammo] Usage: unlimitedammo <on|off>")
+        local pawn, who, rest = parse_target_args(args or {})
+        if not rest or #rest < 1 then
+            print("[unlimitedammo] Usage: unlimitedammo <on|off> [target]")
             return true
         end
-        local enable = parse_bool(args[1])
+        local enable = parse_bool(rest[1])
         if enable == nil then
-            print("[unlimitedammo] Usage: unlimitedammo <on|off>")
+            print("[unlimitedammo] Usage: unlimitedammo <on|off> [target]")
             return true
         end
-        local weapon = get_player_weapon()
+        local weapon = get_player_weapon(pawn)
         local targets = {}
+        local target_is_self = tostring(who or ""):lower() == "self"
         if weapon then
             targets[1] = weapon
-        else
+        elseif target_is_self then
             targets = get_all_weapons()
+        else
+            print("[unlimitedammo] No weapon found for target:", tostring(who))
+            return true
         end
         if #targets == 0 then
             print("[unlimitedammo] No weapons found.")
@@ -3109,15 +4319,20 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         end
         print("[unlimitedammo] Updated:", count)
         return true
-    end, "unlimitedammo <on|off> -> set Unlimited + UnlimitedAmmo", "Weapons")
+    end, "unlimitedammo <on|off> [target] -> set Unlimited + UnlimitedAmmo", "Weapons")
 
     reg("maxammo", function(args)
-        local weapon = get_player_weapon()
+        local pawn, who = parse_target_args(args or {})
+        local weapon = get_player_weapon(pawn)
         local targets = {}
+        local target_is_self = tostring(who or ""):lower() == "self"
         if weapon then
             targets[1] = weapon
-        else
+        elseif target_is_self then
             targets = get_all_weapons()
+        else
+            print("[maxammo] No weapon found for target:", tostring(who))
+            return true
         end
         if #targets == 0 then
             print("[maxammo] No weapons found.")
@@ -3140,11 +4355,12 @@ function Commands.init(Util, Pointers, Teleport, Registry)
         end
         print("[maxammo] Updated:", count)
         return true
-    end, "maxammo -> set Ammo to AmmoMax and AmmoInventory to AmmoInventoryMax", "Weapons")
+    end, "maxammo [target] -> set Ammo to AmmoMax and AmmoInventory to AmmoInventoryMax", "Weapons")
 
     reg("sethp", function(args)
         local pawn, who, rest = parse_target_args(args or {})
         if not pawn then
+            notify_err("Set HP failed: no pawn for target.")
             print("[sethp] No pawn for target:", tostring(who))
             return true
         end
@@ -3158,6 +4374,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local ok = set_prop(pawn, "Health", hp)
+        if ok then
+            notify_ok("HP set to " .. tostring(hp) .. " for " .. tostring(who))
+        else
+            notify_err("Set HP failed: " .. tostring(who))
+        end
         print(ok and ("[sethp] OK -> " .. tostring(who)) or ("[sethp] Failed -> " .. tostring(who)))
         return true
     end, "sethp <number> [target] -> set Health", "Player")
@@ -3165,6 +4386,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
     reg("setmaxhp", function(args)
         local pawn, who, rest = parse_target_args(args or {})
         if not pawn then
+            notify_err("Set Max HP failed: no pawn for target.")
             print("[setmaxhp] No pawn for target:", tostring(who))
             return true
         end
@@ -3178,6 +4400,11 @@ function Commands.init(Util, Pointers, Teleport, Registry)
             return true
         end
         local ok = set_prop(pawn, "MaxHealth", hp)
+        if ok then
+            notify_ok("Max HP set to " .. tostring(hp) .. " for " .. tostring(who))
+        else
+            notify_err("Set Max HP failed: " .. tostring(who))
+        end
         print(ok and ("[setmaxhp] OK -> " .. tostring(who)) or ("[setmaxhp] Failed -> " .. tostring(who)))
         return true
     end, "setmaxhp <number> [target] -> set MaxHealth", "Player")
@@ -3226,7 +4453,7 @@ function Commands.init(Util, Pointers, Teleport, Registry)
     Commands.actions.teleport_list = Commands.actions.tplist
 
     print("[BlackboxRecode] Commands loaded:",
-        "checkcommands, getmap, getpos, hookprints, testsocket, tp, tplist, returnself, returnall, listreturns, tpsetreturn, tpreturn, tpmap, tpallmap, bringallplayers, tpnearest, bringnearest, tp_gui_state, opencontracts, startcontract, listplayers, listplayers_gui, world_registry_scan, world_gui_state, world_tp, world_bring, gotoplayer, bringplayer, tpplayerto, heal, god, stamina, battery, walkspeed, sethp, setmaxhp, invisible, pipeall, pipeset, pipegoto, pipestatus, labairlockstatus, labairlockset, puzzlestate, activateselfdestruct, gotoitem, bringitem, gotoweapon, bringweapon, gotomonster, bringmonster, listmonsters, removemonster, setweapondmg, unlimitedammo, maxammo, help")
+        "checkcommands, getmap, getpos, hookprints, dumpfn, testsocket, tp, tplist, returnself, returnall, listreturns, tpsetreturn, tpreturn, tpmap, tpallmap, bringallplayers, tpnearest, bringnearest, tp_gui_state, opencontracts, startcontract, setcontract, contract_gui_state, listplayers, listplayers_gui, weapon_gui_state, state_snapshot, registry_clear, registry_rebuild, world_registry_scan, world_gui_state, world_tp, world_bring, gotoplayer, bringplayer, tpplayerto, heal, god, stamina, battery, walkspeed, sethp, setmaxhp, invisible, pipeall, pipeset, pipegoto, pipestatus, labairlockstatus, labairlockset, puzzlestate, activateselfdestruct, gotoitem, bringitem, gotoweapon, bringweapon, gotomonster, bringmonster, listmonsters, removemonster, setweapondmg, unlimitedammo, maxammo, help")
 end
 
 return Commands
