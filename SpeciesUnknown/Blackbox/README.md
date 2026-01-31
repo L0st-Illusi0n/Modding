@@ -1,12 +1,12 @@
-# Blackbox Mod
+﻿# Blackbox Mod
 
 ## Overview
 Admin panel mod for the game Species: Unknown, eventually adding more features such as a radar
 This mod uses the lua API from UE4SS and an external python menu (Will be integrated into C++ mod eventually)
 
 ## Status
-🚧 **In Development** - This project is a work in progress, expect errors and broken features.
-Current Status: Working on GUI integration and features
+**In Development** - This project is a work in progress, expect errors and broken features.
+Current Status: GUI integration, overlay state panels, and registry tooling
 
 ## Features
 
@@ -15,6 +15,9 @@ Current Status: Working on GUI integration and features
 - Player listing with GUI support
 - Return position tracking system
 - GUI state management
+- Overlay auto-launch (Windows) with process detection + one-shot guard
+- Robust game-process detection and bridge/overlay health indicators
+- Panel open/close state handling with state payloads
 
 ### Teleportation
 - Teleport to named map locations
@@ -45,6 +48,7 @@ Current Status: Working on GUI integration and features
 - Set weapon damage
 - Set player HP
 - Set player max HP
+- Weapon GUI state (current weapon) with overlay controls
 
 ### Environmental Controls
 - Pipe status checking
@@ -64,6 +68,27 @@ Current Status: Working on GUI integration and features
 - Open contracts interface
 - Start contracts
 - Contract state tracking
+- Contract list discovery + GUI cache + overlay controls
+- Contract GUI state and refresh pipeline
+- Contract list decoding and value/type extraction
+
+### Overlay UI
+- New Weapons and Contracts tabs
+- Weapons UI with unlimited ammo toggle and auto-refresh
+- Contracts UI with list/type/value display and toggle controls
+- Core State panel (map/world/pawn/radar/registry counts + emit/prune timing)
+- State read/write age indicators and refresh scheduling
+
+### Debug & Registry
+- State snapshot action and verbose hookprints toggle
+- Registry metrics and counters in overlay
+- Registry clear/rebuild actions
+- Registry storage rework (by UID/object, stable numeric IDs)
+- Throttled scanning, periodic rescans, and improved pruning
+
+### Utilities
+- Expanded UE utility layer (safe field/call helpers, null/valid checks)
+- Cached controller/pawn/map accessors and UFunction helpers
 
 ## Installation
 Instructions to be added.
